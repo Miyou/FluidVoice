@@ -1,0 +1,73 @@
+name: Fork Build
+
+# Fork-only: builds the Release app with the same Xcode upstream ships with, so the fork can be
+# run day to day from a Mac whose local Xcode is older. Install with ./fork-install.sh.
+on:
+  workflow_dispatch:
+  push:
+    branches: [speaker-id-assist]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  archive:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Archive
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project Fluid.xcodeproj \
+            -scheme Fluid \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/FluidVoice.xcarchive" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/FluidVoice.xcarchive/Products/Applications/FluidVoice.app"
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT"
+          # Xcode's expanded entitlements; fork-install.sh re-signs with them.
+          codesign -d --entitlements - --xml "$APP" > "$OUT/FluidVoice.entitlements"
+          plutil -lint "$OUT/FluidVoice.entitlements"
+
+          # Same layout repair as upstream's PR Archive workflow.
+          CT="$APP/Contents/Frameworks/CTranscribe.framework"
+          rm -rf "$CT/Versions/Current" "$CT/CTranscribe" "$CT/Resources" "$CT/Versions/A/_CodeSignature"
+          ln -s A "$CT/Versions/Current"
+          ln -s Versions/Current/CTranscribe "$CT/CTranscribe"
+          ln -s Versions/Current/Resources "$CT/Resources"
+
+          xcodebuild -version | tr '\n' ' ' > "$OUT/xcode-version.txt"
+          git rev-parse HEAD > "$OUT/commit.txt"
+          ditto -c -k --keepParent "$APP" "$OUT/FluidVoice.app.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FluidVoice-fork-${{ github.sha }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
