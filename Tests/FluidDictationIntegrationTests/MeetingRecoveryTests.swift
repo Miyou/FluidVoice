@@ -4390,7 +4390,9 @@ final class MeetingRecoveryTests: XCTestCase {
             }
             let editor = MeetingAssignSpeakersSheet(
                 speakers: speakers,
-                quotesBySpeaker: Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, ["A short sample of this speaker's words."]) }),
+                quotesBySpeaker: Dictionary(uniqueKeysWithValues: speakers.map {
+                    ($0.id, [MeetingAssignSpeakersQuoteSource.Quote(segmentID: UUID(), text: "A short sample of this speaker's words.")])
+                }),
                 tints: [:],
                 accentColor: FluidBrandColors.blue,
                 onSave: { _ in actions += 1; return nil },
