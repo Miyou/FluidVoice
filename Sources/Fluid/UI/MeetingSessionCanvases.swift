@@ -382,8 +382,14 @@ struct MeetingResultCanvas: View {
     /// Naming is reached by clicking a speaker's name, so the sheet opens on the one clicked.
     private func presentAssignSpeakers(focusing speakerID: SessionSpeakerID?) {
         guard self.isQuiescent, !self.session.activeSpeakers.isEmpty else { return }
+        // The sheet has its own player; two at once would talk over each other.
+        self.playback.stop()
         self.assignSpeakersFocus = speakerID
         self.isShowingAssignSpeakers = true
+    }
+
+    private var canPlayAudio: Bool {
+        self.session.retention.audioDeletedAt == nil && self.session.hasFinalizedAudio && self.isQuiescent
     }
 
     private var speakerNames: [SessionSpeakerID: String] {
@@ -502,7 +508,7 @@ struct MeetingResultCanvas: View {
                                     reassignTargets: activeSpeakers.filter { $0.id != row.segment.speakerID },
                                     isQuiescent: self.isQuiescent,
                                     onReassign: { speakerID in self.onReassignSegment(row.segment.id, speakerID) },
-                                    canPlayAudio: self.session.retention.audioDeletedAt == nil && self.session.hasFinalizedAudio && self.isQuiescent,
+                                    canPlayAudio: self.canPlayAudio,
                                     isAudioExpanded: self.playback.activeSegmentID == row.segment.id,
                                     playback: self.playback,
                                     isLoadingAudio: self.playback.activeSegmentID == row.segment.id && self.playback.isLoading,
@@ -592,11 +598,12 @@ struct MeetingResultCanvas: View {
             MeetingAssignSpeakersSheet(
                 speakers: self.session.activeSpeakers,
                 quotesBySpeaker: Dictionary(uniqueKeysWithValues: self.session.activeSpeakers.map {
-                    ($0.id, MeetingAssignSpeakersQuoteSource.sampleQuotes(for: $0.id, in: self.session.transcriptSegments))
+                    ($0.id, MeetingAssignSpeakersQuoteSource.samples(for: $0.id, in: self.session.transcriptSegments))
                 }),
                 tints: self.speakerTints,
                 accentColor: self.theme.palette.accent,
                 focusedSpeakerID: self.assignSpeakersFocus,
+                audioSessionID: self.canPlayAudio ? self.session.id : nil,
                 onSave: self.onAssignSpeakers,
                 onCancel: { self.isShowingAssignSpeakers = false }
             )

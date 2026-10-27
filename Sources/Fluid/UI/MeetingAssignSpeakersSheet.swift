@@ -2,16 +2,26 @@ import SwiftUI
 
 /// Sample-quote extraction, kept separate from the view so it stays trivially testable.
 nonisolated enum MeetingAssignSpeakersQuoteSource {
+    struct Quote: Equatable, Sendable {
+        let segmentID: MeetingTranscriptSegmentID
+        let text: String
+    }
+
     private static let maxQuoteLength = 180
 
     /// First two things a speaker actually said: final, non-echo, in time order.
     static func sampleQuotes(for speakerID: SessionSpeakerID, in segments: [MeetingTranscriptSegment]) -> [String] {
+        self.samples(for: speakerID, in: segments).map(\.text)
+    }
+
+    /// The same quotes with their segments, so each one can be played.
+    static func samples(for speakerID: SessionSpeakerID, in segments: [MeetingTranscriptSegment]) -> [Quote] {
         segments
             .filter { $0.speakerID == speakerID && !$0.isEcho && $0.status == .final }
             .sorted { $0.start.seconds < $1.start.seconds }
-            .compactMap { segment -> String? in
+            .compactMap { segment -> Quote? in
                 let trimmed = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : Self.truncated(trimmed)
+                return trimmed.isEmpty ? nil : Quote(segmentID: segment.id, text: Self.truncated(trimmed))
             }
             .prefix(2)
             .map { $0 }
@@ -60,14 +70,18 @@ struct MeetingAssignSpeakersSheet: View {
     }
 
     let speakers: [MeetingSessionSpeaker]
-    let quotesBySpeaker: [SessionSpeakerID: [String]]
+    let quotesBySpeaker: [SessionSpeakerID: [MeetingAssignSpeakersQuoteSource.Quote]]
     let tints: [SessionSpeakerID: Color]
     let accentColor: Color
     let focusedSpeakerID: SessionSpeakerID?
+    /// Nil when the meeting's audio cannot be played; quotes then show without play buttons.
+    let audioSessionID: MeetingSessionID?
     let onSave: (MeetingSpeakerEdits) async -> String?
     let onCancel: () -> Void
 
     @Environment(\.theme) private var theme
+    @StateObject private var playback = MeetingSegmentPlayback()
+    @StateObject private var voices = MeetingSpeakerVoiceAssistant()
     @State private var edits: MeetingSpeakerEdits
     @State private var isSaving = false
     @State private var errorMessage: String?
@@ -76,10 +90,11 @@ struct MeetingAssignSpeakersSheet: View {
 
     init(
         speakers: [MeetingSessionSpeaker],
-        quotesBySpeaker: [SessionSpeakerID: [String]],
+        quotesBySpeaker: [SessionSpeakerID: [MeetingAssignSpeakersQuoteSource.Quote]],
         tints: [SessionSpeakerID: Color],
         accentColor: Color,
         focusedSpeakerID: SessionSpeakerID? = nil,
+        audioSessionID: MeetingSessionID? = nil,
         onSave: @escaping (MeetingSpeakerEdits) async -> String?,
         onCancel: @escaping () -> Void
     ) {
@@ -88,6 +103,7 @@ struct MeetingAssignSpeakersSheet: View {
         self.tints = tints
         self.accentColor = accentColor
         self.focusedSpeakerID = focusedSpeakerID
+        self.audioSessionID = audioSessionID
         self.onSave = onSave
         self.onCancel = onCancel
         self._edits = State(initialValue: MeetingSpeakerEdits(names: Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, $0.displayName) })))
@@ -109,6 +125,9 @@ struct MeetingAssignSpeakersSheet: View {
                     .padding(self.theme.metrics.spacing.xl)
                 }
                 .onAppear {
+                    if let audioSessionID = self.audioSessionID {
+                        self.voices.start(sessionID: audioSessionID, speakers: self.speakers)
+                    }
                     guard let focusedSpeakerID = self.focusedSpeakerID else { return }
                     proxy.scrollTo(focusedSpeakerID, anchor: .center)
                     self.focusedField = focusedSpeakerID
@@ -142,6 +161,10 @@ struct MeetingAssignSpeakersSheet: View {
             }
             .padding(self.theme.metrics.spacing.lg)
         }
+        .onDisappear {
+            self.playback.stop()
+            self.voices.cancel()
+        }
         .frame(minWidth: 480, idealWidth: 560, maxWidth: 560)
         .frame(minHeight: 420, idealHeight: 560)
         .background(self.theme.palette.windowBackground)
@@ -168,7 +191,7 @@ struct MeetingAssignSpeakersSheet: View {
             VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xs) {
                 Text("Edit speakers")
                     .font(self.theme.typography.title)
-                Text("Rename voices or merge duplicate speakers. Changes apply when you save.")
+                Text(self.headerDetail)
                     .font(self.theme.typography.bodySmall)
                     .foregroundStyle(self.theme.palette.secondaryText)
             }
@@ -181,6 +204,15 @@ struct MeetingAssignSpeakersSheet: View {
         }
         .padding(.horizontal, self.theme.metrics.spacing.xl)
         .padding(.vertical, self.theme.metrics.spacing.lg)
+    }
+
+    private var headerDetail: String {
+        switch self.voices.status {
+        case .listening:
+            "Listening for voices you named before…"
+        default:
+            "Rename voices or merge duplicate speakers. Changes apply when you save."
+        }
     }
 
     @ViewBuilder
@@ -211,15 +243,25 @@ struct MeetingAssignSpeakersSheet: View {
             } else {
                 VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xs) {
                     ForEach(Array(quotes.enumerated()), id: \.offset) { _, quote in
-                        Text(quote)
-                            .font(self.theme.typography.bodySmall)
-                            .foregroundStyle(self.theme.palette.secondaryText)
-                            .padding(.leading, self.theme.metrics.spacing.md)
-                            .overlay(alignment: .leading) {
-                                Rectangle().fill(tint.opacity(0.35)).frame(width: 2)
-                            }
+                        self.quoteRow(quote, speaker: speaker, tint: tint)
                     }
                 }
+            }
+
+            if let suggestion = self.pendingSuggestion(for: speaker) {
+                HStack(spacing: self.theme.metrics.spacing.sm) {
+                    Image(systemName: "waveform.badge.magnifyingglass")
+                        .foregroundStyle(tint)
+                    Text("Sounds like \(suggestion.name)")
+                        .font(self.theme.typography.bodySmall)
+                        .foregroundStyle(self.theme.palette.primaryText)
+                    Spacer(minLength: 0)
+                    Button("Use \(suggestion.name)") { self.edits.names[speaker.id] = suggestion.name }
+                        .meetingGlassAction()
+                        .disabled(self.isSaving)
+                        .help("Fill in \(suggestion.name). Play a quote above to check first.")
+                }
+                .accessibilityElement(children: .combine)
             }
 
             HStack(spacing: self.theme.metrics.spacing.md) {
@@ -272,6 +314,53 @@ struct MeetingAssignSpeakersSheet: View {
         }
     }
 
+    @ViewBuilder
+    private func quoteRow(_ quote: MeetingAssignSpeakersQuoteSource.Quote, speaker: MeetingSessionSpeaker, tint: Color) -> some View {
+        let isActive = self.playback.activeSegmentID == quote.segmentID
+        VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xs) {
+            HStack(alignment: .firstTextBaseline, spacing: self.theme.metrics.spacing.sm) {
+                if let audioSessionID = self.audioSessionID {
+                    Button(isActive ? "Close audio" : "Play", systemImage: isActive ? "xmark" : "play.fill") {
+                        if isActive {
+                            self.playback.stop()
+                        } else {
+                            self.playback.toggle(sessionID: audioSessionID, segmentID: quote.segmentID)
+                        }
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(tint)
+                    .help(isActive ? "Close audio player" : "Play this line")
+                    .accessibilityLabel(isActive ? "Close audio player" : "Play line by \(self.speakerName(speaker.id))")
+                }
+                Text(quote.text)
+                    .font(self.theme.typography.bodySmall)
+                    .foregroundStyle(self.theme.palette.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if isActive {
+                MeetingSegmentAudioPlayer(playback: self.playback, isLoading: self.playback.isLoading)
+                    .frame(maxWidth: 360, alignment: .leading)
+            }
+        }
+        .padding(.leading, self.theme.metrics.spacing.md)
+        .overlay(alignment: .leading) {
+            Rectangle().fill(tint.opacity(0.35)).frame(width: 2)
+        }
+    }
+
+    /// A suggestion is shown until the user types a real name for that speaker.
+    private func pendingSuggestion(for speaker: MeetingSessionSpeaker) -> MeetingSpeakerVoiceSuggestion? {
+        guard self.edits.merges[speaker.id] == nil, let suggestion = self.voices.suggestions[speaker.id] else { return nil }
+        let typed = self.edits.names[speaker.id] ?? speaker.displayName
+        guard MeetingSpeakerVoiceSuggester.isPlaceholderName(typed) else { return nil }
+        let usedElsewhere = self.speakers.contains {
+            $0.id != speaker.id && self.edits.merges[$0.id] == nil
+                && self.speakerName($0.id).caseInsensitiveCompare(suggestion.name) == .orderedSame
+        }
+        return usedElsewhere ? nil : suggestion
+    }
+
     private func mergeTargets(for speaker: MeetingSessionSpeaker) -> [MeetingSessionSpeaker] {
         self.speakers.filter {
             $0.id != speaker.id && !$0.isLocalUser && $0.trackKind == speaker.trackKind
@@ -302,6 +391,9 @@ struct MeetingAssignSpeakersSheet: View {
         if let message {
             self.errorMessage = message
         } else {
+            if let audioSessionID = self.audioSessionID {
+                self.voices.learn(sessionID: audioSessionID, edits: self.edits)
+            }
             // No separate "dismiss" callback: onCancel is just "close the sheet" either way.
             self.onCancel()
         }
