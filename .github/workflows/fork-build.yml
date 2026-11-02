@@ -5,7 +5,7 @@ name: Fork Build
 on:
   workflow_dispatch:
   push:
-    branches: [speaker-id-assist]
+    branches: [speaker-id-assist, fork-daily]
 
 permissions:
   contents: read
@@ -30,10 +30,29 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      # Local Xcode 26.2 can no longer compile upstream's test target, so the fork's own tests
+      # (plus the upstream speaker-editor tests they sit next to) run here.
+      - name: Test fork changes
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project Fluid.xcodeproj \
+            -scheme Fluid \
+            -destination 'platform=macOS,arch=arm64' \
+            -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceprintTests \
+            -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceMatcherTests \
+            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorRendersSmallAndLargeListsWithoutSaving \
+            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSampleQuotesExcludesEchoAndNonFinalOrdersByStartTimeCapsAtTwo \
+            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorSavesNamesAndMergesTogetherAndUndoesOnce \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+
+      # FLUIDVOICE_DIAGNOSTICS turns on debug-level lines in ~/Library/Logs/Fluid/Fluid.log, so
+      # meeting capture problems can be traced after the fact.
       - name: Archive
         run: |
           set -euo pipefail
           xcodebuild archive \
+            OTHER_SWIFT_FLAGS="-DFLUIDVOICE_DIAGNOSTICS" \
             -project Fluid.xcodeproj \
             -scheme Fluid \
             -configuration Release \
