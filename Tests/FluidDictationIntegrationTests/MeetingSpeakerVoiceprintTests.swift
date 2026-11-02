@@ -189,6 +189,26 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
                            different.min() ?? -1, different.isEmpty ? -1 : different.reduce(0, +) / Float(different.count), different.count))
     }
 
+    func testClipCacheReusesUnchangedSpeakersAndReembedsChangedOnes() {
+        let kept = SessionSpeakerID()
+        let changed = SessionSpeakerID()
+        let added = SessionSpeakerID()
+        let silent = SessionSpeakerID()
+        let keptTurns = [UUID(), UUID()]
+        let cached: [SessionSpeakerID: MeetingSpeakerVoiceClipCache.Entry] = [
+            kept: .init(segmentIDs: keptTurns, clips: [self.vector(angle: 0)]),
+            changed: .init(segmentIDs: [UUID()], clips: [self.vector(angle: 1)]),
+        ]
+        let plan = MeetingSpeakerVoiceClipCache.plan(cached: cached, wanted: [
+            kept: keptTurns,
+            changed: [UUID()], // a merge or reassignment gave it different turns
+            added: [UUID()],
+            silent: [], // no clean turns: nothing to embed
+        ])
+        XCTAssertEqual(Set(plan.reuse.keys), [kept])
+        XCTAssertEqual(Set(plan.embed), [changed, added])
+    }
+
     // MARK: - Helpers
 
     /// Unit vectors on a circle in the first two of 256 dimensions; cosine distance = 1 - cos(Δangle).

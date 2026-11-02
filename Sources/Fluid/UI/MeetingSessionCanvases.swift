@@ -612,6 +612,12 @@ struct MeetingResultCanvas: View {
             self.isShowingAssignSpeakers = false
             self.pendingNameUnknownSegmentID = nil
         }
+        // Embeds speakers in the background while the meeting is read, so Edit speakers can
+        // suggest names as soon as it opens. Speaker edits change the segments and re-run it.
+        .task(id: "\(self.session.id)|\(self.canPlayAudio)|\(self.session.transcriptSegments.count)|\(self.session.activeSpeakers.count)") {
+            guard self.canPlayAudio, !self.session.activeSpeakers.isEmpty else { return }
+            _ = try? await MeetingSpeakerVoiceClipCache.shared.clips(sessionID: self.session.id)
+        }
         .sheet(isPresented: self.$isShowingAssignSpeakers) {
             MeetingAssignSpeakersSheet(
                 speakers: self.session.activeSpeakers,

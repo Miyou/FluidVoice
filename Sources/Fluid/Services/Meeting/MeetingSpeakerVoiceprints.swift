@@ -254,6 +254,93 @@ final nonisolated class MeetingSpeakerVoiceEmbedder: @unchecked Sendable {
     #endif
 }
 
+/// Per-meeting speaker embeddings, prepared when a meeting is opened so Edit speakers can suggest
+/// names at once. Each entry remembers the turns it came from; a speaker is embedded again only
+/// when those change (a merge or reassignment). Embeddings only, kept outside the meeting folder.
+actor MeetingSpeakerVoiceClipCache {
+    nonisolated struct Entry: Codable, Equatable, Sendable {
+        var segmentIDs: [MeetingTranscriptSegmentID]
+        var clips: [[Float]]
+    }
+
+    static let shared = MeetingSpeakerVoiceClipCache()
+
+    private let directory: URL
+    private var inFlight: [MeetingSessionID: Task<[SessionSpeakerID: [[Float]]], Error>] = [:]
+
+    init(directory: URL? = nil) {
+        if let directory {
+            self.directory = directory
+        } else {
+            let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+            self.directory = applicationSupport
+                .appendingPathComponent("FluidVoice", isDirectory: true)
+                .appendingPathComponent("SpeakerVoiceClips", isDirectory: true)
+        }
+    }
+
+    /// Which speakers can reuse their cached embeddings, and which need embedding (again).
+    nonisolated static func plan(
+        cached: [SessionSpeakerID: Entry],
+        wanted: [SessionSpeakerID: [MeetingTranscriptSegmentID]]
+    ) -> (reuse: [SessionSpeakerID: Entry], embed: [SessionSpeakerID]) {
+        var reuse: [SessionSpeakerID: Entry] = [:]
+        var embed: [SessionSpeakerID] = []
+        for (speakerID, segmentIDs) in wanted where !segmentIDs.isEmpty {
+            if let entry = cached[speakerID], entry.segmentIDs == segmentIDs {
+                reuse[speakerID] = entry
+            } else {
+                embed.append(speakerID)
+            }
+        }
+        return (reuse, embed.sorted { $0.uuidString < $1.uuidString })
+    }
+
+    /// Clips for every active speaker, embedding only what is missing or stale. Concurrent callers
+    /// for one meeting (the background pass and an opened sheet) share a single pass.
+    func clips(sessionID: MeetingSessionID) async throws -> [SessionSpeakerID: [[Float]]] {
+        if let running = self.inFlight[sessionID] { return try await running.value }
+        let file = self.directory.appendingPathComponent("\(sessionID.uuidString).json")
+        let directory = self.directory
+        let pass = Task.detached(priority: .utility) {
+            try await Self.refresh(sessionID: sessionID, file: file, directory: directory)
+        }
+        self.inFlight[sessionID] = pass
+        defer { self.inFlight[sessionID] = nil }
+        return try await pass.value
+    }
+
+    private nonisolated static func refresh(
+        sessionID: MeetingSessionID, file: URL, directory: URL
+    ) async throws -> [SessionSpeakerID: [[Float]]] {
+        guard let session = try await MeetingSessionStore.shared.load(id: sessionID),
+              let sessionDirectory = try await MeetingSessionStore.shared.existingSessionDirectory(for: sessionID)
+        else { throw MeetingSegmentPlaybackError.unavailable }
+        let cached = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([SessionSpeakerID: Entry].self, from: $0) } ?? [:]
+        let wanted = Dictionary(uniqueKeysWithValues: session.activeSpeakers.map { speaker in
+            (speaker.id, MeetingSpeakerVoiceClipSource.segments(for: speaker.id, in: session.transcriptSegments).map(\.id))
+        })
+        let plan = Self.plan(cached: cached, wanted: wanted)
+        var entries = plan.reuse
+        let embedder = MeetingSpeakerVoiceEmbedder()
+        for speakerID in plan.embed {
+            try Task.checkCancellation()
+            let clips = try await embedder.clips(session: session, speakerID: speakerID, directory: sessionDirectory)
+            entries[speakerID] = Entry(segmentIDs: wanted[speakerID] ?? [], clips: clips)
+        }
+        if entries != cached {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try JSONEncoder().encode(entries).write(to: file, options: [.atomic])
+        }
+        DebugLogger.shared.info(
+            "voice-clips session=\(sessionID.uuidString.prefix(8)) reused=\(plan.reuse.count) embedded=\(plan.embed.count)",
+            source: "MeetingSpeakerVoice"
+        )
+        return entries.compactMapValues { $0.clips.isEmpty ? nil : $0.clips }
+    }
+}
+
 /// Drives the Edit speakers sheet: embeds each speaker once, offers names for unnamed ones, and
 /// teaches the store the names the user saves.
 @MainActor
@@ -269,31 +356,25 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
     @Published private(set) var suggestions: [SessionSpeakerID: MeetingSpeakerVoiceSuggestion] = [:]
 
     private let store: MeetingSpeakerVoiceprintStore
+    private let clipCache: MeetingSpeakerVoiceClipCache
     private var clipsBySpeaker: [SessionSpeakerID: [[Float]]] = [:]
     private var task: Task<Void, Never>?
 
-    init(store: MeetingSpeakerVoiceprintStore = .shared) {
+    init(store: MeetingSpeakerVoiceprintStore = .shared, clipCache: MeetingSpeakerVoiceClipCache = .shared) {
         self.store = store
+        self.clipCache = clipCache
     }
 
     func start(sessionID: MeetingSessionID, speakers: [MeetingSessionSpeaker]) {
         guard self.status == .idle else { return }
         self.status = .listening
         let store = self.store
+        let clipCache = self.clipCache
         self.task = Task { [weak self] in
             do {
-                guard let session = try await MeetingSessionStore.shared.load(id: sessionID),
-                      let directory = try await MeetingSessionStore.shared.existingSessionDirectory(for: sessionID)
-                else { throw MeetingSegmentPlaybackError.unavailable }
-                let embedder = MeetingSpeakerVoiceEmbedder()
-                var clipsBySpeaker: [SessionSpeakerID: [[Float]]] = [:]
-                for speaker in speakers {
-                    try Task.checkCancellation()
-                    let clips = try await Task.detached(priority: .userInitiated) {
-                        try await embedder.clips(session: session, speakerID: speaker.id, directory: directory)
-                    }.value
-                    if !clips.isEmpty { clipsBySpeaker[speaker.id] = clips }
-                }
+                // Usually already prepared when the meeting was opened, so this is a file read.
+                let speakerIDs = Set(speakers.map(\.id))
+                let clipsBySpeaker = try await clipCache.clips(sessionID: sessionID).filter { speakerIDs.contains($0.key) }
                 let voiceprints = await store.all()
                 let unnamed = speakers.filter { MeetingSpeakerVoiceSuggester.isPlaceholderName($0.displayName) }.map(\.id)
                 let taken = Set(speakers.map(\.displayName).filter { !MeetingSpeakerVoiceSuggester.isPlaceholderName($0) })
@@ -340,23 +421,13 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
     func learn(sessionID: MeetingSessionID, edits: MeetingSpeakerEdits) {
         let cached = self.clipsBySpeaker
         let store = self.store
+        let clipCache = self.clipCache
         Task.detached(priority: .utility) {
-            let embedder = MeetingSpeakerVoiceEmbedder()
-            var context: (session: MeetingSession, directory: URL)?
+            // The save may have merged speakers, so the cache re-embeds any whose turns changed.
+            let current = (try? await clipCache.clips(sessionID: sessionID)) ?? cached
             for (speakerID, name) in edits.names where edits.merges[speakerID] == nil {
-                var clips = cached[speakerID] ?? []
+                let clips = current[speakerID] ?? []
                 do {
-                    if clips.isEmpty, !MeetingSpeakerVoiceSuggester.isPlaceholderName(name) {
-                        if context == nil,
-                           let session = try await MeetingSessionStore.shared.load(id: sessionID),
-                           let directory = try await MeetingSessionStore.shared.existingSessionDirectory(for: sessionID)
-                        {
-                            context = (session, directory)
-                        }
-                        if let context {
-                            clips = try await embedder.clips(session: context.session, speakerID: speakerID, directory: context.directory)
-                        }
-                    }
                     try await store.learn(name: name, clips: clips, sessionID: sessionID, speakerID: speakerID)
                 } catch {
                     DebugLogger.shared.info("voice-learn failed: \(error.localizedDescription)", source: "MeetingSpeakerVoice")
