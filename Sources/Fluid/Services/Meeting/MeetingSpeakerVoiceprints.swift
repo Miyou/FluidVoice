@@ -311,6 +311,11 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
                         source: "MeetingSpeakerVoice"
                     )
                 }
+                DebugLogger.shared.info(
+                    "voice-suggest ready speakers=\(clipsBySpeaker.count)/\(speakers.count) "
+                        + "known=\(voiceprints.count) suggestions=\(suggestions.count)",
+                    source: "MeetingSpeakerVoice"
+                )
                 guard let self, !Task.isCancelled else { return }
                 self.clipsBySpeaker = clipsBySpeaker
                 self.suggestions = suggestions
@@ -330,18 +335,34 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
 
     /// Called after a successful save. Merged speakers teach nothing: their audio now belongs to
     /// the target, whose own clips already cover the voice.
+    /// Runs independently of the sheet: a save made before the sheet finished listening still
+    /// teaches every named speaker, embedding whichever ones it had not reached yet.
     func learn(sessionID: MeetingSessionID, edits: MeetingSpeakerEdits) {
-        let clipsBySpeaker = self.clipsBySpeaker
+        let cached = self.clipsBySpeaker
         let store = self.store
-        Task {
-            for (speakerID, clips) in clipsBySpeaker where edits.merges[speakerID] == nil {
-                guard let name = edits.names[speakerID] else { continue }
+        Task.detached(priority: .utility) {
+            let embedder = MeetingSpeakerVoiceEmbedder()
+            var context: (session: MeetingSession, directory: URL)?
+            for (speakerID, name) in edits.names where edits.merges[speakerID] == nil {
+                var clips = cached[speakerID] ?? []
                 do {
+                    if clips.isEmpty, !MeetingSpeakerVoiceSuggester.isPlaceholderName(name) {
+                        if context == nil,
+                           let session = try await MeetingSessionStore.shared.load(id: sessionID),
+                           let directory = try await MeetingSessionStore.shared.existingSessionDirectory(for: sessionID)
+                        {
+                            context = (session, directory)
+                        }
+                        if let context {
+                            clips = try await embedder.clips(session: context.session, speakerID: speakerID, directory: context.directory)
+                        }
+                    }
                     try await store.learn(name: name, clips: clips, sessionID: sessionID, speakerID: speakerID)
                 } catch {
                     DebugLogger.shared.info("voice-learn failed: \(error.localizedDescription)", source: "MeetingSpeakerVoice")
                 }
             }
+            DebugLogger.shared.info("voice-learn saved session=\(sessionID.uuidString.prefix(8))", source: "MeetingSpeakerVoice")
         }
     }
 }
