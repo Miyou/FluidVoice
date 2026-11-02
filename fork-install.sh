@@ -1,14 +1,16 @@
 #!/bin/bash
 # Fork-only: download the latest "Fork Build" artifact, re-sign it with the local Apple
-# Development identity (so macOS permissions survive updates), and place it at $DEST.
-# The official /Applications/FluidVoice.app is never touched.
+# Development identity (so macOS permissions survive updates), and install it as
+# /Applications/FluidVoice.app, so every launch path (Dock, Spotlight, "Quit & Reopen") opens it.
+# An official build found there is first zipped to ~/Applications (a zip, not a second app with the
+# same bundle ID that macOS could launch instead).
 #
 # Usage: ./fork-install.sh [run-id]
 
 set -euo pipefail
 
 REPO="${FLUIDVOICE_FORK_REPO:-Miyou/FluidVoice}"
-DEST_DIR="${FLUIDVOICE_FORK_DEST:-$HOME/Applications/FluidVoice Fork}"
+DEST_DIR="${FLUIDVOICE_FORK_DEST:-/Applications}"
 BRANCH="${FLUIDVOICE_FORK_BRANCH:-fork-daily}"
 RUN_ID="${1:-}"
 
@@ -41,10 +43,22 @@ codesign --force --sign "${IDENTITY}" --timestamp=none --options runtime \
 codesign --verify --deep --strict "${APP}"
 
 mkdir -p "${DEST_DIR}"
-if pgrep -f "${DEST_DIR}/FluidVoice.app/Contents/MacOS/FluidVoice" > /dev/null; then
-    echo "Quit the running fork build first." >&2
+if pgrep -f "FluidVoice.app/Contents/MacOS/FluidVoice" > /dev/null; then
+    echo "Quit FluidVoice first." >&2
     exit 1
 fi
-rm -rf "${DEST_DIR}/FluidVoice.app"
-ditto "${APP}" "${DEST_DIR}/FluidVoice.app"
-echo "Installed: ${DEST_DIR}/FluidVoice.app"
+TARGET="${DEST_DIR}/FluidVoice.app"
+if [ -d "${TARGET}" ]; then
+    MY_TEAM="$(codesign -dv "${APP}" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    THEIR_TEAM="$(codesign -dv "${TARGET}" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    if [ "${THEIR_TEAM}" != "${MY_TEAM}" ]; then
+        VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${TARGET}/Contents/Info.plist")"
+        BACKUP="$HOME/Applications/FluidVoice-official-${VERSION}.zip"
+        mkdir -p "$HOME/Applications"
+        ditto -c -k --keepParent "${TARGET}" "${BACKUP}"
+        echo "Backed up official ${VERSION} to ${BACKUP}"
+    fi
+    rm -rf "${TARGET}"
+fi
+ditto "${APP}" "${TARGET}"
+echo "Installed: ${TARGET}"
