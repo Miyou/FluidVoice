@@ -9,10 +9,11 @@ set -euo pipefail
 
 REPO="${FLUIDVOICE_FORK_REPO:-Miyou/FluidVoice}"
 DEST_DIR="${FLUIDVOICE_FORK_DEST:-$HOME/Applications/FluidVoice Fork}"
+BRANCH="${FLUIDVOICE_FORK_BRANCH:-fork-daily}"
 RUN_ID="${1:-}"
 
 if [ -z "${RUN_ID}" ]; then
-    RUN_ID="$(gh run list -R "${REPO}" --workflow fork-build.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+    RUN_ID="$(gh run list -R "${REPO}" --workflow fork-build.yml --branch "${BRANCH}" --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
 fi
 [ -n "${RUN_ID}" ] || { echo "No successful Fork Build run found." >&2; exit 1; }
 
