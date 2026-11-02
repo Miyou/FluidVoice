@@ -49,14 +49,14 @@ jobs:
       # FLUIDVOICE_DIAGNOSTICS turns on debug-level lines in ~/Library/Logs/Fluid/Fluid.log, so
       # meeting capture problems can be traced after the fact. Set on the app target only: a
       # command-line build setting would also replace the Swift packages' own flags.
-      - name: Enable diagnostics logging
+      - name: Enable diagnostics logging and fork-only code
         run: |
           set -euo pipefail
           PBX=Fluid.xcodeproj/project.pbxproj
           OLD='SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) ARCH_ARM64";'
           test "$(grep -cF "$OLD" "$PBX")" -eq 2
-          sed -i '' 's/SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) ARCH_ARM64";/SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) ARCH_ARM64 FLUIDVOICE_DIAGNOSTICS";/' "$PBX"
-          test "$(grep -c 'ARCH_ARM64 FLUIDVOICE_DIAGNOSTICS";' "$PBX")" -eq 2
+          sed -i '' 's/SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) ARCH_ARM64";/SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) ARCH_ARM64 FLUIDVOICE_DIAGNOSTICS FLUIDVOICE_FORK";/' "$PBX"
+          test "$(grep -c 'ARCH_ARM64 FLUIDVOICE_DIAGNOSTICS FLUIDVOICE_FORK";' "$PBX")" -eq 2
 
       - name: Archive
         run: |

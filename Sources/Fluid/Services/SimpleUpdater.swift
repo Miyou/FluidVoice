@@ -459,6 +459,11 @@ final class SimpleUpdater: ObservableObject {
     }
 
     private func startUpdateCheck(explicit: Bool) {
+        #if FLUIDVOICE_FORK
+        // Fork builds are updated with fork-install.sh; an official update would replace them.
+        DebugLogger.shared.info("Update check skipped: fork build", source: "SimpleUpdater")
+        return
+        #endif
         guard !self.isUpdateInProgress else { return }
         if explicit { self.updatePrompts.dismissUpdateCheckResults() }
         self.updateChannelDidChange()
