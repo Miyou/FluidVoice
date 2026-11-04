@@ -40,16 +40,22 @@ jobs:
       - name: Test fork changes
         run: |
           set -euo pipefail
-          xcodebuild test \
-            -project Fluid.xcodeproj \
-            -scheme Fluid \
-            -destination "platform=macOS,arch=$(uname -m)" \
-            -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceprintTests \
-            -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceMatcherTests \
-            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorRendersSmallAndLargeListsWithoutSaving \
-            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSampleQuotesExcludesEchoAndNonFinalOrdersByStartTimeCapsAtTwo \
-            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorSavesNamesAndMergesTogetherAndUndoesOnce \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+          TESTS=(
+            -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceprintTests
+            -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceMatcherTests
+            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorRendersSmallAndLargeListsWithoutSaving
+            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSampleQuotesExcludesEchoAndNonFinalOrdersByStartTimeCapsAtTwo
+            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorSavesNamesAndMergesTogetherAndUndoesOnce
+          )
+          if [ "$(uname -m)" = arm64 ]; then
+            xcodebuild test -project Fluid.xcodeproj -scheme Fluid -destination 'platform=macOS,arch=arm64' \
+              "${TESTS[@]}" CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+          else
+            # Upstream's tests use Apple Silicon-only APIs, so an Intel runner can only compile them.
+            echo "::warning::Intel runner: tests compiled for arm64 but not run"
+            xcodebuild build-for-testing -project Fluid.xcodeproj -scheme Fluid -destination 'generic/platform=macOS' \
+              ARCHS=arm64 CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+          fi
 
       # FLUIDVOICE_DIAGNOSTICS turns on debug-level lines in ~/Library/Logs/Fluid/Fluid.log, so
       # meeting capture problems can be traced after the fact. Set on the app target only: a
