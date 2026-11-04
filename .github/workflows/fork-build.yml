@@ -4,6 +4,10 @@ name: Fork Build
 # run day to day from a Mac whose local Xcode is older. Install with ./fork-install.sh.
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label (macos-15-intel when Apple Silicon runners are unavailable)
+        default: macos-latest
   push:
     branches: [speaker-id-assist, fork-daily]
 
@@ -16,7 +20,8 @@ concurrency:
 
 jobs:
   archive:
-    runs-on: macos-latest
+    # An Intel runner still archives the Apple Silicon slice: Release builds both architectures.
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -38,7 +43,7 @@ jobs:
           xcodebuild test \
             -project Fluid.xcodeproj \
             -scheme Fluid \
-            -destination 'platform=macOS,arch=arm64' \
+            -destination "platform=macOS,arch=$(uname -m)" \
             -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceprintTests \
             -only-testing:FluidDictationIntegrationTests/MeetingSpeakerVoiceMatcherTests \
             -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorRendersSmallAndLargeListsWithoutSaving \
@@ -91,6 +96,8 @@ jobs:
           ln -s Versions/Current/Resources "$CT/Resources"
 
           xcodebuild -version | tr '\n' ' ' > "$OUT/xcode-version.txt"
+          lipo -archs "$APP/Contents/MacOS/FluidVoice" > "$OUT/archs.txt"
+          grep -q arm64 "$OUT/archs.txt"
           git rev-parse HEAD > "$OUT/commit.txt"
           ditto -c -k --keepParent "$APP" "$OUT/FluidVoice.app.zip"
 
