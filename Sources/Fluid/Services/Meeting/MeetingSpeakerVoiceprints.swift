@@ -99,6 +99,8 @@ nonisolated enum MeetingSpeakerVoiceSuggester {
             return copy
         }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let existing = result.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
+        let clips = self.coherentClips(clips, existing: existing)
         if !self.isPlaceholderName(trimmed), !clips.isEmpty {
             let samples = clips.map { Sample(embedding: $0, sessionID: sessionID, speakerID: speakerID, createdAt: now) }
             if let index = result.firstIndex(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }) {
@@ -109,6 +111,42 @@ nonisolated enum MeetingSpeakerVoiceSuggester {
             }
         }
         return result.filter { !$0.samples.isEmpty }
+    }
+
+    /// The clips that can safely be filed under a name. Diarization sometimes gives two people one
+    /// label, so a named speaker's clips may hold someone else's voice. Against a known voice, only
+    /// clips that sound like it are kept. For a new name, only a clear majority that agree with one
+    /// another is kept; when they don't agree, nothing is learned rather than guessing.
+    static func coherentClips(_ clips: [[Float]], existing: MeetingSpeakerVoiceprint?) -> [[Float]] {
+        if let existing, !existing.samples.isEmpty {
+            return clips.filter { clip in
+                let nearest = existing.samples.compactMap { MeetingSpeakerEmbeddingIndex.cosineDistance(clip, $0.embedding) }.min()
+                return nearest.map { $0 <= self.maximumDistance } ?? false
+            }
+        }
+        guard clips.count > 1 else { return clips }
+        let groups = clips.indices.map { center in
+            clips.indices.filter { other in
+                other == center || (MeetingSpeakerEmbeddingIndex.cosineDistance(clips[center], clips[other]).map { $0 <= self.maximumDistance } ?? false)
+            }
+        }
+        guard let largest = groups.max(by: { $0.count < $1.count }), largest.count * 2 > clips.count else { return [] }
+        return largest.map { clips[$0] }
+    }
+
+    /// Names that different clips of one speaker confidently match. Two or more means the speaker
+    /// is probably two people under one label.
+    static func mixedVoices(clips: [[Float]], voiceprints: [MeetingSpeakerVoiceprint]) -> [String] {
+        var counts: [String: Int] = [:]
+        for clip in clips {
+            let ranked = self.ranked(clips: [clip], voiceprints: voiceprints)
+            guard let best = ranked.first, best.distance <= self.maximumDistance,
+                  ranked.count == 1 || ranked[1].distance - best.distance >= self.ambiguityMargin
+            else { continue }
+            counts[best.name, default: 0] += 1
+        }
+        guard counts.count > 1 else { return [] }
+        return counts.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }.map(\.key)
     }
 
     private typealias Sample = MeetingSpeakerVoiceprint.Sample
@@ -354,6 +392,7 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
 
     @Published private(set) var status: Status = .idle
     @Published private(set) var suggestions: [SessionSpeakerID: MeetingSpeakerVoiceSuggestion] = [:]
+    @Published private(set) var mixedVoices: [SessionSpeakerID: [String]] = [:]
 
     private let store: MeetingSpeakerVoiceprintStore
     private let clipCache: MeetingSpeakerVoiceClipCache
@@ -397,9 +436,14 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
                         + "known=\(voiceprints.count) suggestions=\(suggestions.count)",
                     source: "MeetingSpeakerVoice"
                 )
+                let mixed = clipsBySpeaker.compactMapValues { clips -> [String]? in
+                    let names = MeetingSpeakerVoiceSuggester.mixedVoices(clips: clips, voiceprints: voiceprints)
+                    return names.isEmpty ? nil : names
+                }
                 guard let self, !Task.isCancelled else { return }
                 self.clipsBySpeaker = clipsBySpeaker
-                self.suggestions = suggestions
+                self.mixedVoices = mixed
+                self.suggestions = suggestions.filter { mixed[$0.key] == nil }
                 self.status = .ready
             } catch {
                 guard let self, !Task.isCancelled else { return }

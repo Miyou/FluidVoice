@@ -248,6 +248,18 @@ struct MeetingAssignSpeakersSheet: View {
                 }
             }
 
+            if let names = self.voices.mixedVoices[speaker.id], self.edits.merges[speaker.id] == nil {
+                Label {
+                    Text("May be \(names.count) people: \(ListFormatter.localizedString(byJoining: names)). "
+                        + "Play the lines to check, and move lines that belong to someone else in the transcript.")
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "person.2.wave.2")
+                }
+                .font(self.theme.typography.caption)
+                .foregroundStyle(self.theme.palette.warning)
+            }
+
             if let suggestion = self.pendingSuggestion(for: speaker) {
                 HStack(spacing: self.theme.metrics.spacing.sm) {
                     Image(systemName: "waveform.badge.magnifyingglass")

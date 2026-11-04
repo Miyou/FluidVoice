@@ -209,6 +209,40 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
         XCTAssertEqual(Set(plan.embed), [changed, added])
     }
 
+    func testLearningAKnownNameKeepsOnlyClipsThatSoundLikeThem() {
+        // Speaker 7: two of Daniel's clips and two of someone else's under one label.
+        let daniel = self.print("Daniel", angles: [0])
+        let clips = [self.vector(angle: 0.05), self.vector(angle: 1.4), self.vector(angle: -0.1), self.vector(angle: 1.45)]
+        let kept = MeetingSpeakerVoiceSuggester.coherentClips(clips, existing: daniel)
+        XCTAssertEqual(kept, [self.vector(angle: 0.05), self.vector(angle: -0.1)])
+
+        let prints = MeetingSpeakerVoiceSuggester.learning(
+            [daniel], name: "daniel", clips: clips, sessionID: UUID(), speakerID: UUID(), now: Date()
+        )
+        XCTAssertEqual(prints.first?.samples.count, 3)
+    }
+
+    func testLearningANewNameKeepsOnlyAnAgreeingMajority() {
+        let majority = MeetingSpeakerVoiceSuggester.coherentClips(
+            [self.vector(angle: 0), self.vector(angle: 0.1), self.vector(angle: 1.5)], existing: nil
+        )
+        XCTAssertEqual(majority.count, 2)
+        XCTAssertTrue(MeetingSpeakerVoiceSuggester.coherentClips(
+            [self.vector(angle: 0), self.vector(angle: 1.5)], existing: nil
+        ).isEmpty, "two disagreeing clips: learn nothing rather than guess")
+        XCTAssertEqual(MeetingSpeakerVoiceSuggester.coherentClips([self.vector(angle: 0)], existing: nil).count, 1)
+    }
+
+    func testMixedVoicesNamesEveryConfidentlyMatchedPerson() {
+        let prints = [self.print("Pablo", angles: [0]), self.print("Daniel", angles: [1.5])]
+        XCTAssertEqual(MeetingSpeakerVoiceSuggester.mixedVoices(
+            clips: [self.vector(angle: 0.05), self.vector(angle: 0.1), self.vector(angle: 1.45)], voiceprints: prints
+        ), ["Pablo", "Daniel"])
+        XCTAssertEqual(MeetingSpeakerVoiceSuggester.mixedVoices(
+            clips: [self.vector(angle: 0.05), self.vector(angle: -0.05)], voiceprints: prints
+        ), [])
+    }
+
     // MARK: - Helpers
 
     /// Unit vectors on a circle in the first two of 256 dimensions; cosine distance = 1 - cos(Δangle).
