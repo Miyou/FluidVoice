@@ -22,7 +22,7 @@ jobs:
   archive:
     # An Intel runner still archives the Apple Silicon slice: Release builds both architectures.
     runs-on: ${{ inputs.runner || 'macos-latest' }}
-    timeout-minutes: 45
+    timeout-minutes: 120  # Intel runners are much slower than Apple Silicon ones
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
