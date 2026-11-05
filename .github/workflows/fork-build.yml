@@ -32,8 +32,16 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Show Xcode version
-        run: xcodebuild -version
+      # Xcode 26.2 and 26.3 miscompile FluidVoice (Edit speakers → Save crashes with SIGBUS);
+      # 26.6 is the oldest known-good version. Fail instead of shipping a crashing build.
+      - name: Require Xcode 26.6 or newer
+        run: |
+          xcodebuild -version
+          VERSION=$(xcodebuild -version | sed -n 's/^Xcode //p')
+          if [ "$(printf '%s\n26.6\n' "$VERSION" | sort -V | head -1)" != "26.6" ]; then
+            echo "::error::Xcode $VERSION is older than 26.6, which miscompiles FluidVoice"
+            exit 1
+          fi
 
       # Local Xcode 26.2 can no longer compile upstream's test target, so the fork's own tests
       # (plus the upstream speaker-editor tests they sit next to) run here.
