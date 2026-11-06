@@ -188,6 +188,7 @@ final class MeetingSessionCoordinator: ObservableObject {
             movedSegments: [(id: MeetingTranscriptSegmentID, previousRevision: Int)]
         )
         case renameBatch([(speakerID: SessionSpeakerID, previousName: String)])
+        case moveLines(createdSpeakerIDs: [SessionSpeakerID], previousSegments: [MeetingTranscriptSegment])
         case speakerEdits(
             previousSpeakers: [MeetingSessionSpeaker],
             movedSegments: [(id: MeetingTranscriptSegmentID, speakerID: SessionSpeakerID?, revision: Int)]
@@ -1062,6 +1063,17 @@ final class MeetingSessionCoordinator: ObservableObject {
         }
     }
 
+    /// Moves several lines at once (Move to speaker → New speaker…, Split by voice); one undo step.
+    @discardableResult
+    func moveLines(sessionID: MeetingSessionID, moves: MeetingLineMoves) async throws -> MeetingSession {
+        try await self.performCorrection(sessionID: sessionID) { session in
+            let moved = Set(moves.toExisting.keys).union(moves.toNew.keys)
+            let before = session.transcriptSegments.filter { moved.contains($0.id) }
+            let created = try session.moveLines(moves)
+            return .moveLines(createdSpeakerIDs: created, previousSegments: before)
+        }
+    }
+
     @discardableResult
     func nameUnknownSegment(
         sessionID: MeetingSessionID,
@@ -1366,6 +1378,20 @@ final class MeetingSessionCoordinator: ObservableObject {
             session.transcriptSegments[segmentIndex].overlap = previousOverlap
             session.transcriptSegments[segmentIndex].attributionState = previousAttributionState
             session.transcriptSegments[segmentIndex].revision = previousRevision
+            return true
+        case let .moveLines(createdSpeakerIDs, previousSegments):
+            let restored = Dictionary(uniqueKeysWithValues: previousSegments.map { ($0.id, $0) })
+            let created = Set(createdSpeakerIDs)
+            // A created speaker that has since gained other lines can't be removed cleanly.
+            guard !session.transcriptSegments.contains(where: {
+                restored[$0.id] == nil && $0.speakerID.map(created.contains) == true
+            }) else { return false }
+            for index in session.transcriptSegments.indices {
+                if let original = restored[session.transcriptSegments[index].id] {
+                    session.transcriptSegments[index] = original
+                }
+            }
+            session.speakers.removeAll { created.contains($0.id) }
             return true
         case let .merge(sourceID, _, movedSegments):
             guard let index = session.speakers.firstIndex(where: { $0.id == sourceID }) else { return false }

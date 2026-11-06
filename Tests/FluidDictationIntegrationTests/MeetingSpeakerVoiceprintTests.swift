@@ -334,6 +334,24 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
         ), "BlackHole2ch_UID")
     }
 
+    func testSplitByVoiceMovesConfidentLinesAndLeavesUnclearOnes() {
+        let serge = SessionSpeakerID()
+        let lines = (0..<4).map { _ in UUID() }
+        let plan = MeetingSpeakerVoiceSplitter.plan(lines: [
+            .init(segmentID: lines[0], embedding: self.vector(angle: 0.05)),  // Pablo (saved voice, not in meeting)
+            .init(segmentID: lines[1], embedding: self.vector(angle: 1.52)),  // Serge (speaker in this meeting)
+            .init(segmentID: lines[2], embedding: self.vector(angle: 0.77)),  // halfway: unclear, stays
+            .init(segmentID: lines[3], embedding: self.vector(angle: 3.0)),   // nobody: stays
+        ], references: [
+            .init(target: .new("Pablo"), embeddings: [self.vector(angle: 0)]),
+            .init(target: .existing(serge), embeddings: [self.vector(angle: 1.5)]),
+        ])
+        XCTAssertEqual(plan[lines[0]], .new("Pablo"))
+        XCTAssertEqual(plan[lines[1]], .existing(serge))
+        XCTAssertNil(plan[lines[2]])
+        XCTAssertNil(plan[lines[3]])
+    }
+
     // MARK: - Helpers
 
     private func segment(speakerID: SessionSpeakerID?, start: Double, end: Double, text: String = "words") -> MeetingTranscriptSegment {

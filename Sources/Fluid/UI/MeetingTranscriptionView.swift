@@ -336,6 +336,7 @@ struct MeetingTranscriptionView: View {
                         onUndoCorrection: self.undoTranscriptCorrection,
                         onRenameSession: self.renameMeetingSession,
                         onAssignSpeakers: self.assignSpeakers,
+                        onMoveLines: self.moveLines,
                         canUndoCorrection: { self.coordinator.canUndoCorrection(sessionID: $0) },
                         isQuiescent: self.coordinator.isQuiescent && self.summaryActivity.selectionLock == nil,
                         onRepairSetup: self.repairRecordingSetup,
@@ -891,6 +892,17 @@ struct MeetingTranscriptionView: View {
             } catch {
                 self.actionErrorMessage = error.localizedDescription
             }
+        }
+    }
+
+    private func moveLines(sessionID: MeetingSessionID, moves: MeetingLineMoves) async -> String? {
+        self.actionErrorMessage = nil
+        do {
+            let saved = try await self.coordinator.moveLines(sessionID: sessionID, moves: moves)
+            self.historySnapshot.applySavedSession(saved)
+            return nil
+        } catch {
+            return error.localizedDescription
         }
     }
 
@@ -1467,6 +1479,7 @@ struct MeetingTranscriptionCanvas: View {
     let onUndoCorrection: (MeetingSessionID) async -> Bool
     let onRenameSession: (MeetingSessionID, String) -> Void
     let onAssignSpeakers: (MeetingSessionID, MeetingSpeakerEdits) async -> String?
+    var onMoveLines: (MeetingSessionID, MeetingLineMoves) async -> String? = { _, _ in "Moving lines is unavailable." }
     let canUndoCorrection: (MeetingSessionID) -> Bool
     let isQuiescent: Bool
     let onRepairSetup: () -> Void
@@ -1566,6 +1579,7 @@ struct MeetingTranscriptionCanvas: View {
                         onNameUnknownSegment: { segmentID, name in
                             self.onNameUnknownSegment(session.id, segmentID, name)
                         },
+                        onMoveLines: { moves in await self.onMoveLines(session.id, moves) },
                         onUndo: { await self.onUndoCorrection(session.id) },
                         onRenameSession: { title in self.onRenameSession(session.id, title) },
                         onRetranscribe: { languageCode in self.onRetranscribe(session.id, languageCode) },

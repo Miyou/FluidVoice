@@ -93,6 +93,9 @@ struct MeetingAssignSpeakersSheet: View {
     let audioSessionID: MeetingSessionID?
     /// Text of each line, so lines chosen by voice matching can be shown and played.
     let lineTexts: [MeetingTranscriptSegmentID: String]
+    let onMoveLines: (MeetingLineMoves) async -> String?
+    /// Closes the sheet and shows only this speaker's lines, with an optional note.
+    let onShowLines: (SessionSpeakerID, String?) -> Void
     let onSave: (MeetingSpeakerEdits) async -> String?
     let onCancel: () -> Void
 
@@ -103,6 +106,7 @@ struct MeetingAssignSpeakersSheet: View {
     @State private var isSaving = false
     @State private var errorMessage: String?
     @State private var pendingMerge: MergeRequest?
+    @State private var splittingSpeakerID: SessionSpeakerID?
     @FocusState private var focusedField: SessionSpeakerID?
 
     init(
@@ -113,6 +117,8 @@ struct MeetingAssignSpeakersSheet: View {
         focusedSpeakerID: SessionSpeakerID? = nil,
         audioSessionID: MeetingSessionID? = nil,
         lineTexts: [MeetingTranscriptSegmentID: String] = [:],
+        onMoveLines: @escaping (MeetingLineMoves) async -> String? = { _ in "Moving lines is unavailable." },
+        onShowLines: @escaping (SessionSpeakerID, String?) -> Void = { _, _ in },
         onSave: @escaping (MeetingSpeakerEdits) async -> String?,
         onCancel: @escaping () -> Void
     ) {
@@ -123,6 +129,8 @@ struct MeetingAssignSpeakersSheet: View {
         self.focusedSpeakerID = focusedSpeakerID
         self.audioSessionID = audioSessionID
         self.lineTexts = lineTexts
+        self.onMoveLines = onMoveLines
+        self.onShowLines = onShowLines
         self.onSave = onSave
         self.onCancel = onCancel
         self._edits = State(initialValue: MeetingSpeakerEdits(names: Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, $0.displayName) })))
@@ -282,13 +290,22 @@ struct MeetingAssignSpeakersSheet: View {
             if let names = self.voices.mixedVoices[speaker.id], self.edits.merges[speaker.id] == nil {
                 Label {
                     Text("May be \(names.count) people: \(ListFormatter.localizedString(byJoining: names)). "
-                        + "To fix it, right-click a line in the transcript and choose Move to speaker.")
+                        + "Split by voice moves each line to whoever it sounds like; short lines stay for you to check.")
                         .fixedSize(horizontal: false, vertical: true)
                 } icon: {
                     Image(systemName: "person.2.wave.2")
                 }
                 .font(self.theme.typography.caption)
                 .foregroundStyle(self.theme.palette.warning)
+                HStack(spacing: self.theme.metrics.spacing.sm) {
+                    Button(self.splittingSpeakerID == speaker.id ? "Splitting…" : "Split by voice") {
+                        Task { await self.split(speaker) }
+                    }
+                    .meetingGlassAction()
+                    .disabled(self.isSaving || self.splittingSpeakerID != nil)
+                    Button("Show lines") { self.onShowLines(speaker.id, nil) }
+                        .meetingGlassAction()
+                }
             }
 
             if let suggestion = self.pendingSuggestion(for: speaker) {
@@ -428,6 +445,33 @@ struct MeetingAssignSpeakersSheet: View {
     private func voiceLines(for speaker: MeetingSessionSpeaker) -> [(name: String, quote: MeetingAssignSpeakersQuoteSource.Quote)] {
         (self.voices.linesByVoice[speaker.id] ?? []).compactMap { line in
             self.lineTexts[line.segmentID].map { (line.name, .init(segmentID: line.segmentID, text: $0)) }
+        }
+    }
+
+    /// Moves the speaker's lines by voice, then shows the lines left over for review.
+    private func split(_ speaker: MeetingSessionSpeaker) async {
+        guard let sessionID = self.audioSessionID else { return }
+        self.errorMessage = nil
+        self.splittingSpeakerID = speaker.id
+        defer { self.splittingSpeakerID = nil }
+        do {
+            let result = try await self.voices.splitByVoice(sessionID: sessionID, speakerID: speaker.id)
+            guard !result.moves.isEmpty else {
+                self.errorMessage = "No line of \(speaker.displayName) clearly matches another voice. Check the lines by hand."
+                return
+            }
+            if let message = await self.onMoveLines(result.moves) {
+                self.errorMessage = message
+                return
+            }
+            let moved = result.movedByName.sorted { $0.value > $1.value }.map { "\($0.key) \($0.value)" }
+            self.onShowLines(
+                speaker.id,
+                "Moved \(result.movedByName.values.reduce(0, +)) lines by voice (\(moved.joined(separator: ", "))). "
+                    + "\(result.left) lines are left: too short to judge or unclear. Right-click one to move it."
+            )
+        } catch {
+            self.errorMessage = error.localizedDescription
         }
     }
 

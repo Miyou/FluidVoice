@@ -875,6 +875,16 @@ nonisolated enum MeetingAudioRetentionPolicy: String, Codable, CaseIterable, Sen
 }
 
 /// A speaker editor draft. Nothing is persisted until names and merges are saved together.
+/// Lines to move in one edit: to a speaker already in the meeting, or to a new speaker by name.
+nonisolated struct MeetingLineMoves: Equatable, Sendable {
+    var toExisting: [MeetingTranscriptSegmentID: SessionSpeakerID] = [:]
+    var toNew: [MeetingTranscriptSegmentID: String] = [:]
+
+    var isEmpty: Bool {
+        self.toExisting.isEmpty && self.toNew.isEmpty
+    }
+}
+
 nonisolated struct MeetingSpeakerEdits: Equatable, Sendable {
     var names: [SessionSpeakerID: String]
     var merges: [SessionSpeakerID: SessionSpeakerID] = [:]
@@ -1016,6 +1026,50 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
         guard self.speakers[index].displayName != trimmed else { return }
         self.speakers[index].displayName = trimmed
         self.updatedAt = Date()
+    }
+
+    /// Moves lines to existing speakers or to new ones, as one edit. A new name gets one speaker per
+    /// audio source; a speaker of that name on the same source is reused. Returns created speakers.
+    mutating func moveLines(_ moves: MeetingLineMoves) throws -> [SessionSpeakerID] {
+        var created: [SessionSpeakerID] = []
+        var speakerForName: [String: SessionSpeakerID] = [:]
+        func trackKind(of segmentID: MeetingTranscriptSegmentID) throws -> MeetingAudioTrackKind {
+            guard let segment = self.transcriptSegments.first(where: { $0.id == segmentID }) else {
+                throw MeetingDomainError.segmentNotFound
+            }
+            guard let kind = self.audioTracks.first(where: { $0.id == segment.sourceTrackID })?.kind else {
+                throw MeetingDomainError.segmentTrackNotFound
+            }
+            return kind
+        }
+        var targets = moves.toExisting
+        for (segmentID, rawName) in moves.toNew.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { throw MeetingDomainError.emptySpeakerName }
+            let kind = try trackKind(of: segmentID)
+            let key = "\(kind.rawValue)|\(name.lowercased())"
+            if let id = speakerForName[key] {
+                targets[segmentID] = id
+            } else if let existing = self.activeSpeakers.first(where: {
+                $0.trackKind == kind && $0.displayName.caseInsensitiveCompare(name) == .orderedSame
+            }) {
+                speakerForName[key] = existing.id
+                targets[segmentID] = existing.id
+            } else {
+                let id = UUID()
+                self.speakers.append(MeetingSessionSpeaker(
+                    id: id, displayName: name, diarizationClusterID: nil, trackKind: kind,
+                    isLocalUser: false, identityCandidates: []
+                ))
+                created.append(id)
+                speakerForName[key] = id
+                targets[segmentID] = id
+            }
+        }
+        for (segmentID, speakerID) in targets {
+            try self.reassignSegment(id: segmentID, to: speakerID)
+        }
+        return created
     }
 
     mutating func reassignSegment(id: MeetingTranscriptSegmentID, to speakerID: SessionSpeakerID) throws {

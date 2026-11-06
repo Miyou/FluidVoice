@@ -54,6 +54,7 @@ jobs:
             -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorRendersSmallAndLargeListsWithoutSaving
             -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSampleQuotesExcludesEchoAndNonFinalOrdersByStartTimeCapsAtTwo
             -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testSpeakerEditorSavesNamesAndMergesTogetherAndUndoesOnce
+            -only-testing:FluidDictationIntegrationTests/MeetingRecoveryTests/testMoveLinesToANewSpeakerReusesTheNameAndUndoesInOneStep
           )
           if [ "$(uname -m)" = arm64 ]; then
             xcodebuild test -project Fluid.xcodeproj -scheme Fluid -destination 'platform=macOS,arch=arm64' \

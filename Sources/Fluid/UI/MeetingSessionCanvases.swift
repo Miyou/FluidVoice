@@ -357,6 +357,8 @@ struct MeetingResultCanvas: View {
     let onReassignSegment: (MeetingTranscriptSegmentID, SessionSpeakerID) -> Void
     var onEditTranscriptSegment: (MeetingTranscriptSegmentID, String, Int) async -> String? = { _, _, _ in "Transcript editing is unavailable." }
     let onNameUnknownSegment: (MeetingTranscriptSegmentID, String) -> Void
+    /// Moves lines to existing or new speakers in one undoable edit; returns an error message.
+    var onMoveLines: (MeetingLineMoves) async -> String? = { _ in "Moving lines is unavailable." }
     let onUndo: () async -> Bool
     let onRenameSession: (String) -> Void
     let onRetranscribe: (String) -> Void
@@ -371,6 +373,11 @@ struct MeetingResultCanvas: View {
     @StateObject private var correctionUndo = MeetingCorrectionUndoRegistration()
     @State private var pendingEditedSegment: MeetingTranscriptSegment?
     @State private var pendingNameUnknownSegmentID: MeetingTranscriptSegmentID?
+    @State private var pendingNewSpeakerSegmentID: MeetingTranscriptSegmentID?
+    @State private var pendingNewSpeakerName = ""
+    /// Shows only one speaker's lines, to review or fix a speaker without scrolling the meeting.
+    @State private var speakerFilter: SessionSpeakerID?
+    @State private var speakerFilterNote: String?
     @State private var pendingUnknownSpeakerName = ""
     @State private var isRenamingSession = false
     @State private var pendingRenameSessionText = ""
@@ -390,6 +397,29 @@ struct MeetingResultCanvas: View {
         self.playback.stop()
         self.assignSpeakersFocus = speakerID
         self.isShowingAssignSpeakers = true
+    }
+
+    private func speakerFilterBanner(filter: SessionSpeakerID, lineCount: Int) -> some View {
+        let name = self.session.activeSpeakers.first { $0.id == filter }.map { self.displayName(for: $0) } ?? "this speaker"
+        return VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xs) {
+            HStack(spacing: self.theme.metrics.spacing.sm) {
+                Label("Showing only \(name)’s lines (\(lineCount))", systemImage: "line.3.horizontal.decrease.circle")
+                    .font(self.theme.typography.caption)
+                    .foregroundStyle(self.theme.palette.secondaryText)
+                Spacer(minLength: 0)
+                Button("Show all") {
+                    self.speakerFilter = nil
+                    self.speakerFilterNote = nil
+                }
+                .fluidGlassAction()
+            }
+            if let note = self.speakerFilterNote {
+                Text(note)
+                    .font(self.theme.typography.caption)
+                    .foregroundStyle(self.theme.palette.tertiaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     /// A line keeps its audio source: microphone lines move only between microphone speakers, and
@@ -449,12 +479,109 @@ struct MeetingResultCanvas: View {
     }
 
     var body: some View {
+        self.document
+            .alert(
+                "Move to New Speaker",
+                isPresented: Binding(
+                    get: { self.pendingNewSpeakerSegmentID != nil },
+                    set: { if !$0 { self.pendingNewSpeakerSegmentID = nil } }
+                )
+            ) {
+                TextField("Speaker name", text: self.$pendingNewSpeakerName)
+                Button("Cancel", role: .cancel) { self.pendingNewSpeakerSegmentID = nil }
+                Button("Move") {
+                    if let segmentID = self.pendingNewSpeakerSegmentID {
+                        let moves = MeetingLineMoves(toNew: [segmentID: self.pendingNewSpeakerName])
+                        Task { _ = await self.onMoveLines(moves) }
+                    }
+                    self.pendingNewSpeakerSegmentID = nil
+                }
+            } message: {
+                Text("The line moves to a new speaker on the same audio source. A speaker with this name is reused.")
+            }
+    }
+
+    private func transcriptRow(
+        _ row: (segment: MeetingTranscriptSegment, showsLabel: Bool, isLocal: Bool),
+        speakerNames: [SessionSpeakerID: String],
+        activeSpeakers: [MeetingSessionSpeaker]
+    ) -> some View {
+        MeetingTranscriptSegmentRow(
+            segment: row.segment,
+            speakerName: MeetingTranscriptExporter.speakerLabel(for: row.segment, in: self.session, speakerNames: speakerNames),
+            speakerTint: row.segment.speakerID.flatMap { self.speakerTints[$0] },
+            onNameUnknown: {
+                self.pendingNameUnknownSegmentID = row.segment.id
+                self.pendingUnknownSpeakerName = ""
+            },
+            isLocalUser: row.isLocal,
+            reassignTargets: Self.reassignTargets(for: row.segment, among: activeSpeakers),
+            isQuiescent: self.isQuiescent,
+            onReassign: { speakerID in self.onReassignSegment(row.segment.id, speakerID) },
+            canPlayAudio: self.canPlayAudio,
+            isAudioExpanded: self.playback.activeSegmentID == row.segment.id,
+            playback: self.playback,
+            isLoadingAudio: self.playback.activeSegmentID == row.segment.id && self.playback.isLoading,
+            onPlayAudio: { self.playback.toggle(sessionID: self.session.id, segmentID: row.segment.id) },
+            onMoveToNewSpeaker: {
+                self.pendingNewSpeakerSegmentID = row.segment.id
+                self.pendingNewSpeakerName = ""
+            },
+            isEditingText: self.pendingEditedSegment?.id == row.segment.id,
+            onEditText: { if self.isQuiescent { self.pendingEditedSegment = row.segment } },
+            onSaveText: { text in
+                guard let editing = self.pendingEditedSegment, editing.id == row.segment.id else {
+                    return "This paragraph is no longer being edited."
+                }
+                let error = await self.onEditTranscriptSegment(editing.id, text, editing.revision)
+                if error == nil, self.pendingEditedSegment?.id == editing.id {
+                    self.pendingEditedSegment = nil
+                }
+                return error
+            },
+            onCancelEditText: {
+                if self.pendingEditedSegment?.id == row.segment.id { self.pendingEditedSegment = nil }
+            }
+        )
+    }
+
+    private func assignSpeakersSheet() -> some View {
+        MeetingAssignSpeakersSheet(
+            speakers: self.session.activeSpeakers,
+            quotesBySpeaker: Dictionary(uniqueKeysWithValues: self.session.activeSpeakers.map {
+                ($0.id, MeetingAssignSpeakersQuoteSource.samples(for: $0.id, in: self.session.transcriptSegments))
+            }),
+            tints: self.speakerTints,
+            accentColor: self.theme.palette.accent,
+            focusedSpeakerID: self.assignSpeakersFocus,
+            audioSessionID: self.canPlayAudio ? self.session.id : nil,
+            lineTexts: MeetingAssignSpeakersQuoteSource.lineTexts(
+                for: Set(self.session.activeSpeakers.map(\.id)), in: self.session.transcriptSegments
+            ),
+            onMoveLines: self.onMoveLines,
+            onShowLines: { speakerID, note in
+                self.isShowingAssignSpeakers = false
+                self.speakerFilter = speakerID
+                self.speakerFilterNote = note
+            },
+            onSave: self.onAssignSpeakers,
+            onCancel: { self.isShowingAssignSpeakers = false }
+        )
+    }
+
+    private func filteredBySpeaker(_ segments: [MeetingTranscriptSegment]) -> [MeetingTranscriptSegment] {
+        guard let filter = self.speakerFilter else { return segments }
+        return segments.filter { $0.speakerID == filter }
+    }
+
+    @ViewBuilder private var document: some View {
         let speakerNames = self.speakerNames
         let sorted = self.session.transcriptSegments.sorted { $0.start.seconds < $1.start.seconds }
         let visibleSegments = self.visibleSegments(sorted: sorted)
         let visibleSpeakerIDs = Set(visibleSegments.compactMap(\.speakerID))
         let activeSpeakers = self.session.activeSpeakers.filter { visibleSpeakerIDs.contains($0.id) }
-        let rows = self.rows(for: visibleSegments)
+        let filteredSegments = self.filteredBySpeaker(visibleSegments)
+        let rows = self.rows(for: filteredSegments)
         // One scroller preserves a readable document at short window heights.
         ScrollView {
             VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xxl) {
@@ -487,6 +614,10 @@ struct MeetingResultCanvas: View {
                         }
                     }
 
+                    if let filter = self.speakerFilter {
+                        self.speakerFilterBanner(filter: filter, lineCount: filteredSegments.count)
+                    }
+
                     if let errorMessage = self.playback.errorMessage {
                         Label(errorMessage, systemImage: "exclamationmark.triangle")
                             .font(self.theme.typography.caption)
@@ -507,43 +638,7 @@ struct MeetingResultCanvas: View {
                     } else {
                         LazyVStack(alignment: .leading, spacing: self.theme.metrics.spacing.xxl) {
                             ForEach(rows, id: \.segment.id) { row in
-                                MeetingTranscriptSegmentRow(
-                                    segment: row.segment,
-                                    speakerName: MeetingTranscriptExporter.speakerLabel(
-                                        for: row.segment,
-                                        in: self.session,
-                                        speakerNames: speakerNames
-                                    ),
-                                    speakerTint: row.segment.speakerID.flatMap { self.speakerTints[$0] },
-                                    onNameUnknown: {
-                                        self.pendingNameUnknownSegmentID = row.segment.id
-                                        self.pendingUnknownSpeakerName = ""
-                                    },
-                                    isLocalUser: row.isLocal,
-                                    reassignTargets: Self.reassignTargets(for: row.segment, among: activeSpeakers),
-                                    isQuiescent: self.isQuiescent,
-                                    onReassign: { speakerID in self.onReassignSegment(row.segment.id, speakerID) },
-                                    canPlayAudio: self.canPlayAudio,
-                                    isAudioExpanded: self.playback.activeSegmentID == row.segment.id,
-                                    playback: self.playback,
-                                    isLoadingAudio: self.playback.activeSegmentID == row.segment.id && self.playback.isLoading,
-                                    onPlayAudio: { self.playback.toggle(sessionID: self.session.id, segmentID: row.segment.id) },
-                                    isEditingText: self.pendingEditedSegment?.id == row.segment.id,
-                                    onEditText: { if self.isQuiescent { self.pendingEditedSegment = row.segment } },
-                                    onSaveText: { text in
-                                        guard let editing = self.pendingEditedSegment, editing.id == row.segment.id else {
-                                            return "This paragraph is no longer being edited."
-                                        }
-                                        let error = await self.onEditTranscriptSegment(editing.id, text, editing.revision)
-                                        if error == nil, self.pendingEditedSegment?.id == editing.id {
-                                            self.pendingEditedSegment = nil
-                                        }
-                                        return error
-                                    },
-                                    onCancelEditText: {
-                                        if self.pendingEditedSegment?.id == row.segment.id { self.pendingEditedSegment = nil }
-                                    }
-                                )
+                                self.transcriptRow(row, speakerNames: speakerNames, activeSpeakers: activeSpeakers)
                             }
                         }
                         .padding(.bottom, self.theme.metrics.spacing.xxl)
@@ -622,6 +717,8 @@ struct MeetingResultCanvas: View {
             self.showsProbableEchoes = false
             self.isShowingAssignSpeakers = false
             self.pendingNameUnknownSegmentID = nil
+            self.speakerFilter = nil
+            self.speakerFilterNote = nil
         }
         // Embeds speakers in the background while the meeting is read, so Edit speakers can
         // suggest names as soon as it opens. Speaker edits change the segments and re-run it.
@@ -630,21 +727,7 @@ struct MeetingResultCanvas: View {
             _ = try? await MeetingSpeakerVoiceClipCache.shared.clips(sessionID: self.session.id)
         }
         .sheet(isPresented: self.$isShowingAssignSpeakers) {
-            MeetingAssignSpeakersSheet(
-                speakers: self.session.activeSpeakers,
-                quotesBySpeaker: Dictionary(uniqueKeysWithValues: self.session.activeSpeakers.map {
-                    ($0.id, MeetingAssignSpeakersQuoteSource.samples(for: $0.id, in: self.session.transcriptSegments))
-                }),
-                tints: self.speakerTints,
-                accentColor: self.theme.palette.accent,
-                focusedSpeakerID: self.assignSpeakersFocus,
-                audioSessionID: self.canPlayAudio ? self.session.id : nil,
-                lineTexts: MeetingAssignSpeakersQuoteSource.lineTexts(
-                    for: Set(self.session.activeSpeakers.map(\.id)), in: self.session.transcriptSegments
-                ),
-                onSave: self.onAssignSpeakers,
-                onCancel: { self.isShowingAssignSpeakers = false }
-            )
+            self.assignSpeakersSheet()
         }
     }
 
@@ -727,6 +810,12 @@ struct MeetingResultCanvas: View {
                             action: { self.presentAssignSpeakers(focusing: speaker.id) }
                         )
                         .disabled(!self.isQuiescent)
+                        .contextMenu {
+                            Button("Show only \(self.displayName(for: speaker))’s lines", systemImage: "line.3.horizontal.decrease") {
+                                self.speakerFilter = speaker.id
+                                self.speakerFilterNote = nil
+                            }
+                        }
                     }
                 }
                 .padding(.vertical, self.theme.metrics.spacing.xs)
@@ -1141,6 +1230,7 @@ private struct MeetingTranscriptSegmentRow: View {
     let playback: MeetingSegmentPlayback
     let isLoadingAudio: Bool
     let onPlayAudio: () -> Void
+    var onMoveToNewSpeaker: (() -> Void)? = nil
     let isEditingText: Bool
     let onEditText: () -> Void
     let onSaveText: (String) async -> String?
@@ -1229,7 +1319,7 @@ private struct MeetingTranscriptSegmentRow: View {
                     }
                     .disabled(!self.isQuiescent)
                 }
-            } else if !self.reassignTargets.isEmpty {
+            } else if !self.reassignTargets.isEmpty || self.onMoveToNewSpeaker != nil {
                 // Diarization sometimes gives two people one label; this moves a line to the right one.
                 Divider()
                 Menu("Move to speaker") {
@@ -1237,6 +1327,13 @@ private struct MeetingTranscriptSegmentRow: View {
                         Button(target.displayName) {
                             self.playback.stop()
                             self.onReassign(target.id)
+                        }
+                    }
+                    if let onMoveToNewSpeaker = self.onMoveToNewSpeaker {
+                        Divider()
+                        Button("New speaker…") {
+                            self.playback.stop()
+                            onMoveToNewSpeaker()
                         }
                     }
                 }

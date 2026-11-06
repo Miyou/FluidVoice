@@ -282,6 +282,44 @@ actor MeetingSpeakerVoiceprintStore {
     }
 }
 
+/// Sorts a mixed speaker's lines by voice: each line goes to the speaker (already in the meeting,
+/// or a known voice not yet in it) it confidently sounds like. Unclear lines stay where they are.
+nonisolated enum MeetingSpeakerVoiceSplitter {
+    enum Target: Hashable, Sendable {
+        case existing(SessionSpeakerID)
+        case new(String)
+    }
+
+    struct Reference: Sendable {
+        let target: Target
+        let embeddings: [[Float]]
+    }
+
+    static func plan(lines: [MeetingSpeakerVoiceClip], references: [Reference]) -> [MeetingTranscriptSegmentID: Target] {
+        var plan: [MeetingTranscriptSegmentID: Target] = [:]
+        for line in lines {
+            let ranked = references.compactMap { reference -> (Target, Float)? in
+                let nearest = reference.embeddings.compactMap {
+                    MeetingSpeakerEmbeddingIndex.cosineDistance(line.embedding, $0)
+                }.min()
+                return nearest.map { (reference.target, $0) }
+            }.sorted { $0.1 < $1.1 }
+            guard let best = ranked.first, best.1 <= MeetingSpeakerVoiceSuggester.maximumDistance else { continue }
+            if ranked.count > 1, ranked[1].1 - best.1 < MeetingSpeakerVoiceSuggester.ambiguityMargin { continue }
+            plan[line.segmentID] = best.0
+        }
+        return plan
+    }
+
+    /// Lines long enough to embed: everything the voice model can judge, not only the top few.
+    static func embeddableLines(of speakerID: SessionSpeakerID, in segments: [MeetingTranscriptSegment]) -> [MeetingTranscriptSegment] {
+        segments.filter {
+            $0.speakerID == speakerID && !$0.isEcho && $0.status == .final
+                && $0.end.seconds - $0.start.seconds >= MeetingSpeakerVoiceClipSource.minimumSeconds + 0.4
+        }
+    }
+}
+
 /// One embedded turn: the voice vector and the transcript line it came from.
 nonisolated struct MeetingSpeakerVoiceClip: Equatable, Sendable {
     let segmentID: MeetingTranscriptSegmentID
@@ -297,11 +335,20 @@ final nonisolated class MeetingSpeakerVoiceEmbedder: @unchecked Sendable {
     #endif
 
     func clips(session: MeetingSession, speakerID: SessionSpeakerID, directory: URL) async throws -> [MeetingSpeakerVoiceClip] {
+        try await self.clips(
+            session: session,
+            segments: MeetingSpeakerVoiceClipSource.segments(for: speakerID, in: session.transcriptSegments),
+            directory: directory
+        )
+    }
+
+    /// Embeds the given lines; lines too short for a reliable voice sample are skipped.
+    func clips(session: MeetingSession, segments: [MeetingTranscriptSegment], directory: URL) async throws -> [MeetingSpeakerVoiceClip] {
         #if arch(arm64)
         let extractor = try await self.loadExtractor()
         let mask = [Float](repeating: 1, count: self.maskFrames)
         var clips: [MeetingSpeakerVoiceClip] = []
-        for segment in MeetingSpeakerVoiceClipSource.segments(for: speakerID, in: session.transcriptSegments) {
+        for segment in segments {
             try Task.checkCancellation()
             guard let slices = try? MeetingSegmentPlaybackPlan.slices(session: session, segment: segment, directory: directory)
             else { continue }
@@ -532,6 +579,57 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
     func cancel() {
         self.task?.cancel()
         self.task = nil
+    }
+
+    /// Plans moving a mixed speaker's lines to whoever each one sounds like. References are the
+    /// other speakers on the same audio source (their cached clips, plus their saved voice if
+    /// named) and saved voices of people not yet in the meeting, who would become new speakers.
+    func splitByVoice(
+        sessionID: MeetingSessionID,
+        speakerID: SessionSpeakerID
+    ) async throws -> (moves: MeetingLineMoves, movedByName: [String: Int], left: Int) {
+        guard let session = try await MeetingSessionStore.shared.load(id: sessionID),
+              let directory = try await MeetingSessionStore.shared.existingSessionDirectory(for: sessionID),
+              let mixed = session.activeSpeakers.first(where: { $0.id == speakerID })
+        else { throw MeetingSegmentPlaybackError.unavailable }
+        let voiceprints = await self.store.all()
+        let cached = (try? await self.clipCache.clips(sessionID: sessionID)) ?? [:]
+        let others = session.activeSpeakers.filter { $0.id != speakerID && $0.trackKind == mixed.trackKind }
+        var references: [MeetingSpeakerVoiceSplitter.Reference] = others.compactMap { other in
+            var embeddings = (cached[other.id] ?? []).map(\.embedding)
+            if let print = voiceprints.first(where: { $0.name.caseInsensitiveCompare(other.displayName) == .orderedSame }) {
+                embeddings += print.samples.map(\.embedding)
+            }
+            return embeddings.isEmpty ? nil : .init(target: .existing(other.id), embeddings: embeddings)
+        }
+        let present = Set((others.map(\.displayName) + [mixed.displayName]).map { $0.lowercased() })
+        references += voiceprints.filter { !present.contains($0.name.lowercased()) }.map {
+            .init(target: .new($0.name), embeddings: $0.samples.map(\.embedding))
+        }
+        let lines = MeetingSpeakerVoiceSplitter.embeddableLines(of: speakerID, in: session.transcriptSegments)
+        let embedder = MeetingSpeakerVoiceEmbedder()
+        let clips = try await Task.detached(priority: .userInitiated) {
+            try await embedder.clips(session: session, segments: lines, directory: directory)
+        }.value
+        let plan = MeetingSpeakerVoiceSplitter.plan(lines: clips, references: references)
+        var moves = MeetingLineMoves()
+        var movedByName: [String: Int] = [:]
+        for (segmentID, target) in plan {
+            switch target {
+            case let .existing(id):
+                moves.toExisting[segmentID] = id
+                movedByName[others.first { $0.id == id }?.displayName ?? "Speaker", default: 0] += 1
+            case let .new(name):
+                moves.toNew[segmentID] = name
+                movedByName[name, default: 0] += 1
+            }
+        }
+        let total = session.transcriptSegments.filter { $0.speakerID == speakerID }.count
+        DebugLogger.shared.info(
+            "voice-split speaker=\(mixed.displayName) lines=\(total) embedded=\(clips.count) moved=\(plan.count)",
+            source: "MeetingSpeakerVoice"
+        )
+        return (moves, movedByName, total - plan.count)
     }
 
     /// Called after a successful save. Merged speakers teach nothing: their audio now belongs to

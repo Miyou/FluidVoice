@@ -4432,6 +4432,34 @@ final class MeetingRecoveryTests: XCTestCase {
         XCTAssertFalse(coordinator.canUndoCorrection(sessionID: session.id), "one editor save is one correction")
     }
 
+    func testMoveLinesToANewSpeakerReusesTheNameAndUndoesInOneStep() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        var (session, speakerA, _, firstLine) = self.makeCorrectionSession(state: .completed)
+        var second = self.makeTranscriptSegment(sourceTrackID: session.audioTracks[0].id, speakerID: speakerA)
+        second.start = MeetingMediaTime(value: 10, timescale: 1)
+        second.end = MeetingMediaTime(value: 14, timescale: 1)
+        session.transcriptSegments.append(second)
+        try await store.create(session)
+        let coordinator = MeetingSessionCoordinator(
+            store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter()
+        )
+        // Split by voice: both lines go to "Pablo", who isn't in the meeting yet: one new speaker.
+        let saved = try await coordinator.moveLines(
+            sessionID: session.id, moves: MeetingLineMoves(toNew: [firstLine: "Pablo", second.id: " pablo "])
+        )
+        let pablo = try XCTUnwrap(saved.activeSpeakers.first { $0.displayName == "Pablo" })
+        XCTAssertEqual(saved.activeSpeakers.count, session.activeSpeakers.count + 1)
+        XCTAssertEqual(saved.transcriptSegments.map(\.speakerID), [pablo.id, pablo.id])
+        XCTAssertEqual(pablo.trackKind, .microphone, "a new speaker joins the line's own audio source")
+
+        let undone = try await coordinator.undoTranscriptCorrection(sessionID: session.id)
+        XCTAssertEqual(undone.speakers, session.speakers, "undo removes the created speaker")
+        XCTAssertEqual(undone.transcriptSegments, session.transcriptSegments)
+        XCTAssertFalse(coordinator.canUndoCorrection(sessionID: session.id), "one move is one correction")
+    }
+
     func testSpeakerEditorInvalidMergeDoesNotSaveNamesOrTouchAudio() async throws {
         let dir = self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
