@@ -392,6 +392,17 @@ struct MeetingResultCanvas: View {
         self.isShowingAssignSpeakers = true
     }
 
+    /// A line keeps its audio source: microphone lines move only between microphone speakers, and
+    /// call-audio lines between call-audio speakers. Unknown lines may go to anyone, as before.
+    static func reassignTargets(
+        for segment: MeetingTranscriptSegment,
+        among speakers: [MeetingSessionSpeaker]
+    ) -> [MeetingSessionSpeaker] {
+        guard let current = segment.speakerID else { return speakers }
+        let kind = speakers.first { $0.id == current }?.trackKind
+        return speakers.filter { $0.id != current && (kind == nil || $0.trackKind == kind) }
+    }
+
     private var canPlayAudio: Bool {
         self.session.retention.audioDeletedAt == nil && self.session.hasFinalizedAudio && self.isQuiescent
     }
@@ -509,7 +520,7 @@ struct MeetingResultCanvas: View {
                                         self.pendingUnknownSpeakerName = ""
                                     },
                                     isLocalUser: row.isLocal,
-                                    reassignTargets: activeSpeakers.filter { $0.id != row.segment.speakerID },
+                                    reassignTargets: Self.reassignTargets(for: row.segment, among: activeSpeakers),
                                     isQuiescent: self.isQuiescent,
                                     onReassign: { speakerID in self.onReassignSegment(row.segment.id, speakerID) },
                                     canPlayAudio: self.canPlayAudio,
@@ -628,6 +639,9 @@ struct MeetingResultCanvas: View {
                 accentColor: self.theme.palette.accent,
                 focusedSpeakerID: self.assignSpeakersFocus,
                 audioSessionID: self.canPlayAudio ? self.session.id : nil,
+                lineTexts: MeetingAssignSpeakersQuoteSource.lineTexts(
+                    for: Set(self.session.activeSpeakers.map(\.id)), in: self.session.transcriptSegments
+                ),
                 onSave: self.onAssignSpeakers,
                 onCancel: { self.isShowingAssignSpeakers = false }
             )
@@ -1215,6 +1229,18 @@ private struct MeetingTranscriptSegmentRow: View {
                     }
                     .disabled(!self.isQuiescent)
                 }
+            } else if !self.reassignTargets.isEmpty {
+                // Diarization sometimes gives two people one label; this moves a line to the right one.
+                Divider()
+                Menu("Move to speaker") {
+                    ForEach(self.reassignTargets) { target in
+                        Button(target.displayName) {
+                            self.playback.stop()
+                            self.onReassign(target.id)
+                        }
+                    }
+                }
+                .disabled(!self.isQuiescent || self.isEditingText)
             }
         }
         .accessibilityElement(children: .contain)

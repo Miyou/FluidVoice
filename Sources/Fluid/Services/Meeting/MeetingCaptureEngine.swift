@@ -2658,9 +2658,9 @@ nonisolated enum MeetingCaptureSourceCatalog {
 
     static func microphoneSnapshot() async -> MeetingMicrophoneCatalogSnapshot {
         await AudioTopologyListenerExecution.perform {
-            let identities = AudioDevice.listInputDevicesRefreshingLiveness().compactMap { device -> MeetingMicrophoneIdentity? in
-                guard device.isAlive, device.uid.isEmpty == false else { return nil }
-                return MeetingMicrophoneIdentity(
+            let devices = AudioDevice.listInputDevicesRefreshingLiveness().filter { $0.isAlive && !$0.uid.isEmpty }
+            let identities = devices.map { device in
+                MeetingMicrophoneIdentity(
                     captureDeviceID: device.uid,
                     coreAudioUID: device.uid,
                     displayName: device.name
@@ -2668,7 +2668,10 @@ nonisolated enum MeetingCaptureSourceCatalog {
             }
             return MeetingMicrophoneCatalogSnapshot(
                 identities: identities,
-                defaultCoreAudioUID: AudioDevice.getDefaultInputDevice()?.uid
+                defaultCoreAudioUID: MeetingMicrophoneDefaultPolicy.effectiveDefaultUID(
+                    systemDefaultUID: AudioDevice.getDefaultInputDevice()?.uid,
+                    devices: devices.map { ($0.uid, $0.transportType) }
+                )
             )
         }
     }
@@ -2689,6 +2692,25 @@ nonisolated enum MeetingCaptureSourceCatalog {
               let microphone = microphones.first(where: { $0.coreAudioUID == defaultUID })
         else { throw MeetingCaptureError.microphoneUnavailable }
         return microphone
+    }
+}
+
+/// When a microphone disappears mid-meeting (AirPods disconnect), macOS may make a virtual device
+/// such as BlackHole or Background Music the default input. Following it records silence, so a
+/// virtual or aggregate default is replaced by a real microphone, preferring the built-in one.
+/// A virtual device the user picks explicitly is still honoured; this only governs the default.
+nonisolated enum MeetingMicrophoneDefaultPolicy {
+    static func isRealMicrophone(transportType: UInt32) -> Bool {
+        transportType != kAudioDeviceTransportTypeVirtual && transportType != kAudioDeviceTransportTypeAggregate
+    }
+
+    static func effectiveDefaultUID(systemDefaultUID: String?, devices: [(uid: String, transportType: UInt32)]) -> String? {
+        guard let systemDefaultUID,
+              let current = devices.first(where: { $0.uid == systemDefaultUID }),
+              !self.isRealMicrophone(transportType: current.transportType)
+        else { return systemDefaultUID }
+        let real = devices.filter { self.isRealMicrophone(transportType: $0.transportType) }
+        return (real.first { $0.transportType == kAudioDeviceTransportTypeBuiltIn } ?? real.first)?.uid ?? systemDefaultUID
     }
 }
 

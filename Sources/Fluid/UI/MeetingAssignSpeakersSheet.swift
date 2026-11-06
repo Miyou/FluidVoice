@@ -14,17 +14,27 @@ nonisolated enum MeetingAssignSpeakersQuoteSource {
         self.samples(for: speakerID, in: segments).map(\.text)
     }
 
-    /// The same quotes with their segments, so each one can be played.
+    /// The same quotes with their segments, so each one can be played. Clean turns (3 s or longer,
+    /// no overlap) come first: a short first line often catches the previous speaker too.
     static func samples(for speakerID: SessionSpeakerID, in segments: [MeetingTranscriptSegment]) -> [Quote] {
-        segments
+        let spoken = segments
             .filter { $0.speakerID == speakerID && !$0.isEcho && $0.status == .final }
+            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .sorted { $0.start.seconds < $1.start.seconds }
-            .compactMap { segment -> Quote? in
-                let trimmed = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : Quote(segmentID: segment.id, text: Self.truncated(trimmed))
-            }
+        let isClean = { (segment: MeetingTranscriptSegment) in
+            segment.overlap == .none && segment.end.seconds - segment.start.seconds >= MeetingSpeakerVoiceClipSource.minimumSeconds
+        }
+        return (spoken.filter(isClean) + spoken.filter { !isClean($0) })
             .prefix(2)
-            .map { $0 }
+            .map { Quote(segmentID: $0.id, text: Self.truncated($0.text.trimmingCharacters(in: .whitespacesAndNewlines))) }
+    }
+
+    /// Display text for any line, for voice lines picked after the sheet opened.
+    static func lineTexts(for speakerIDs: Set<SessionSpeakerID>, in segments: [MeetingTranscriptSegment]) -> [MeetingTranscriptSegmentID: String] {
+        Dictionary(uniqueKeysWithValues: segments.compactMap { segment in
+            guard let speakerID = segment.speakerID, speakerIDs.contains(speakerID) else { return nil }
+            return (segment.id, Self.truncated(segment.text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        })
     }
 
     private static func truncated(_ text: String) -> String {
@@ -42,9 +52,12 @@ nonisolated enum MeetingAssignSpeakersValidation {
     /// Only a collision the user just created blocks the save. Two speakers can already share a
     /// name — the pipeline emits a bare "Speaker" for re-matched clusters — and that transcript
     /// must stay nameable rather than deadlocking on a duplicate nobody typed.
+    /// Speakers on different audio sources may share a name: one person on the microphone and on
+    /// the call (joined again from a phone) can't be merged, so the same name is how they're joined.
     static func duplicateName(
         current: [(id: SessionSpeakerID, displayName: String)],
-        drafts: [SessionSpeakerID: String]
+        drafts: [SessionSpeakerID: String],
+        trackKinds: [SessionSpeakerID: MeetingAudioTrackKind] = [:]
     ) -> String? {
         let resulting = current.map { speaker -> (name: String, changed: Bool) in
             let typed = (drafts[speaker.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -52,9 +65,11 @@ nonisolated enum MeetingAssignSpeakersValidation {
             return (name, name != speaker.displayName)
         }
         for index in resulting.indices {
-            for other in resulting[(index + 1)...]
+            for (offset, other) in resulting[(index + 1)...].enumerated()
                 where other.name.caseInsensitiveCompare(resulting[index].name) == .orderedSame
             {
+                let otherID = current[index + 1 + offset].id
+                if let mine = trackKinds[current[index].id], let theirs = trackKinds[otherID], mine != theirs { continue }
                 guard resulting[index].changed || other.changed else { continue }
                 return other.name
             }
@@ -76,6 +91,8 @@ struct MeetingAssignSpeakersSheet: View {
     let focusedSpeakerID: SessionSpeakerID?
     /// Nil when the meeting's audio cannot be played; quotes then show without play buttons.
     let audioSessionID: MeetingSessionID?
+    /// Text of each line, so lines chosen by voice matching can be shown and played.
+    let lineTexts: [MeetingTranscriptSegmentID: String]
     let onSave: (MeetingSpeakerEdits) async -> String?
     let onCancel: () -> Void
 
@@ -95,6 +112,7 @@ struct MeetingAssignSpeakersSheet: View {
         accentColor: Color,
         focusedSpeakerID: SessionSpeakerID? = nil,
         audioSessionID: MeetingSessionID? = nil,
+        lineTexts: [MeetingTranscriptSegmentID: String] = [:],
         onSave: @escaping (MeetingSpeakerEdits) async -> String?,
         onCancel: @escaping () -> Void
     ) {
@@ -104,6 +122,7 @@ struct MeetingAssignSpeakersSheet: View {
         self.accentColor = accentColor
         self.focusedSpeakerID = focusedSpeakerID
         self.audioSessionID = audioSessionID
+        self.lineTexts = lineTexts
         self.onSave = onSave
         self.onCancel = onCancel
         self._edits = State(initialValue: MeetingSpeakerEdits(names: Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, $0.displayName) })))
@@ -231,8 +250,20 @@ struct MeetingAssignSpeakersSheet: View {
                     .foregroundStyle(self.theme.palette.secondaryText)
             }
 
+            let voiceLines = self.voiceLines(for: speaker)
             let quotes = self.quotesBySpeaker[speaker.id] ?? []
-            if quotes.isEmpty {
+            if !voiceLines.isEmpty {
+                // A mixed speaker: one line per voice, so each person can be heard on their own.
+                VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xs) {
+                    ForEach(Array(voiceLines.enumerated()), id: \.offset) { _, line in
+                        Text("Sounds like \(line.name)")
+                            .font(self.theme.typography.captionSmall)
+                            .foregroundStyle(self.theme.palette.secondaryText)
+                            .padding(.leading, self.theme.metrics.spacing.md)
+                        self.quoteRow(line.quote, speaker: speaker, tint: tint)
+                    }
+                }
+            } else if quotes.isEmpty {
                 Text("No transcript sample")
                     .font(self.theme.typography.bodySmall)
                     .foregroundStyle(self.theme.palette.tertiaryText)
@@ -251,7 +282,7 @@ struct MeetingAssignSpeakersSheet: View {
             if let names = self.voices.mixedVoices[speaker.id], self.edits.merges[speaker.id] == nil {
                 Label {
                     Text("May be \(names.count) people: \(ListFormatter.localizedString(byJoining: names)). "
-                        + "Play the lines to check, and move lines that belong to someone else in the transcript.")
+                        + "To fix it, right-click a line in the transcript and choose Move to speaker.")
                         .fixedSize(horizontal: false, vertical: true)
                 } icon: {
                     Image(systemName: "person.2.wave.2")
@@ -264,14 +295,29 @@ struct MeetingAssignSpeakersSheet: View {
                 HStack(spacing: self.theme.metrics.spacing.sm) {
                     Image(systemName: "waveform.badge.magnifyingglass")
                         .foregroundStyle(tint)
-                    Text("Sounds like \(suggestion.name)")
-                        .font(self.theme.typography.bodySmall)
-                        .foregroundStyle(self.theme.palette.primaryText)
-                    Spacer(minLength: 0)
-                    Button("Use \(suggestion.name)") { self.edits.names[speaker.id] = suggestion.name }
-                        .meetingGlassAction()
-                        .disabled(self.isSaving)
-                        .help("Fill in \(suggestion.name). Play a quote above to check first.")
+                    switch suggestion.relation {
+                    case let .sameVoiceAs(target):
+                        Text("Same voice as \(self.speakerName(target))")
+                            .font(self.theme.typography.bodySmall)
+                            .foregroundStyle(self.theme.palette.primaryText)
+                        Spacer(minLength: 0)
+                        if self.mergeTargets(for: speaker).contains(where: { $0.id == target }) {
+                            Button("Merge") { self.pendingMerge = MergeRequest(source: speaker.id, target: target) }
+                                .meetingGlassAction()
+                                .disabled(self.isSaving)
+                                .help("Merge into \(self.speakerName(target)). Play a line above to check first.")
+                        }
+                    case .new, .alsoOnOtherSource:
+                        Text(suggestion.relation == .new ? "Sounds like \(suggestion.name)"
+                            : "Sounds like \(suggestion.name) (also on the \(speaker.trackKind == .microphone ? "call audio" : "microphone"))")
+                            .font(self.theme.typography.bodySmall)
+                            .foregroundStyle(self.theme.palette.primaryText)
+                        Spacer(minLength: 0)
+                        Button("Use \(suggestion.name)") { self.edits.names[speaker.id] = suggestion.name }
+                            .meetingGlassAction()
+                            .disabled(self.isSaving)
+                            .help("Fill in \(suggestion.name). Play a quote above to check first.")
+                    }
                 }
                 .accessibilityElement(children: .combine)
             }
@@ -361,16 +407,28 @@ struct MeetingAssignSpeakersSheet: View {
         }
     }
 
-    /// A suggestion is shown until the user types a real name for that speaker.
+    /// A suggestion is shown until the user types a real name for that speaker or merges it.
     private func pendingSuggestion(for speaker: MeetingSessionSpeaker) -> MeetingSpeakerVoiceSuggestion? {
-        guard self.edits.merges[speaker.id] == nil, let suggestion = self.voices.suggestions[speaker.id] else { return nil }
+        guard self.edits.merges[speaker.id] == nil, self.voices.mixedVoices[speaker.id] == nil,
+              let suggestion = self.voices.suggestions[speaker.id]
+        else { return nil }
         let typed = self.edits.names[speaker.id] ?? speaker.displayName
         guard MeetingSpeakerVoiceSuggester.isPlaceholderName(typed) else { return nil }
-        let usedElsewhere = self.speakers.contains {
-            $0.id != speaker.id && self.edits.merges[$0.id] == nil
+        if case let .sameVoiceAs(target) = suggestion.relation {
+            return self.edits.merges[target] == nil ? suggestion : nil
+        }
+        // A name the user just gave another speaker on this audio source is taken there.
+        let usedOnThisSource = self.speakers.contains {
+            $0.id != speaker.id && $0.trackKind == speaker.trackKind && self.edits.merges[$0.id] == nil
                 && self.speakerName($0.id).caseInsensitiveCompare(suggestion.name) == .orderedSame
         }
-        return usedElsewhere ? nil : suggestion
+        return usedOnThisSource && suggestion.relation == .new ? nil : suggestion
+    }
+
+    private func voiceLines(for speaker: MeetingSessionSpeaker) -> [(name: String, quote: MeetingAssignSpeakersQuoteSource.Quote)] {
+        (self.voices.linesByVoice[speaker.id] ?? []).compactMap { line in
+            self.lineTexts[line.segmentID].map { (line.name, .init(segmentID: line.segmentID, text: $0)) }
+        }
     }
 
     private func mergeTargets(for speaker: MeetingSessionSpeaker) -> [MeetingSessionSpeaker] {
@@ -390,7 +448,8 @@ struct MeetingAssignSpeakersSheet: View {
 
         if let duplicate = MeetingAssignSpeakersValidation.duplicateName(
             current: self.speakers.filter { self.edits.merges[$0.id] == nil }.map { (id: $0.id, displayName: $0.displayName) },
-            drafts: self.edits.names
+            drafts: self.edits.names,
+            trackKinds: Dictionary(uniqueKeysWithValues: self.speakers.map { ($0.id, $0.trackKind) })
         ) {
             self.errorMessage = "Two speakers are both named \"\(duplicate)\". Give them different names, or merge them here."
             return

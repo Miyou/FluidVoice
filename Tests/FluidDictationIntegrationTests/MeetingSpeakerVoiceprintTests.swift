@@ -1,3 +1,4 @@
+import CoreAudio
 @testable import FluidVoice_Debug
 import Foundation
 import XCTest
@@ -15,50 +16,112 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
     func testSuggestsTheClosestNameWhenItIsCloseAndUnambiguous() {
         let speaker = SessionSpeakerID()
         let suggestions = MeetingSpeakerVoiceSuggester.suggestions(
+            speakers: [.init(id: speaker, name: "Speaker 1", trackKind: .applicationAudio)],
             clipsBySpeaker: [speaker: [self.vector(angle: 0.05), self.vector(angle: -0.05)]],
-            voiceprints: [self.print("Serge", angles: [0]), self.print("Milan", angles: [1.2])],
-            takenNames: []
+            voiceprints: [self.print("Serge", angles: [0]), self.print("Milan", angles: [1.2])]
         )
         XCTAssertEqual(suggestions[speaker]?.name, "Serge")
+        XCTAssertEqual(suggestions[speaker]?.relation, .new)
     }
 
     func testNoSuggestionWhenTooFarOrAmbiguous() {
         let speaker = SessionSpeakerID()
+        let candidates: [MeetingSpeakerVoiceCandidate] = [.init(id: speaker, name: "Speaker 1", trackKind: .applicationAudio)]
         let far = MeetingSpeakerVoiceSuggester.suggestions(
-            clipsBySpeaker: [speaker: [self.vector(angle: 0)]],
-            voiceprints: [self.print("Serge", angles: [1.4])],
-            takenNames: []
+            speakers: candidates, clipsBySpeaker: [speaker: [self.vector(angle: 0)]],
+            voiceprints: [self.print("Serge", angles: [1.4])]
         )
         XCTAssertNil(far[speaker])
 
         let ambiguous = MeetingSpeakerVoiceSuggester.suggestions(
-            clipsBySpeaker: [speaker: [self.vector(angle: 0)]],
-            voiceprints: [self.print("Serge", angles: [0.30]), self.print("Milan", angles: [-0.31])],
-            takenNames: []
+            speakers: candidates, clipsBySpeaker: [speaker: [self.vector(angle: 0)]],
+            voiceprints: [self.print("Serge", angles: [0.30]), self.print("Milan", angles: [-0.31])]
         )
         XCTAssertNil(ambiguous[speaker])
     }
 
-    func testNamesAlreadyInTheMeetingAreNotOffered() {
-        let speaker = SessionSpeakerID()
+    func testAVoiceAlreadyNamedOnTheOtherSourceIsOfferedForTheSameName() {
+        // 2026-11-06: Michael on the microphone, then again on the call audio after joining by phone.
+        let mic = SessionSpeakerID()
+        let phone = SessionSpeakerID()
         let suggestions = MeetingSpeakerVoiceSuggester.suggestions(
-            clipsBySpeaker: [speaker: [self.vector(angle: 0)]],
-            voiceprints: [self.print("Serge", angles: [0])],
-            takenNames: ["serge"]
+            speakers: [.init(id: mic, name: "Michael", trackKind: .microphone),
+                       .init(id: phone, name: "Speaker 5", trackKind: .applicationAudio)],
+            clipsBySpeaker: [mic: [self.vector(angle: 0)], phone: [self.vector(angle: 0.1)]],
+            voiceprints: [self.print("Michael", angles: [0])]
         )
-        XCTAssertNil(suggestions[speaker])
+        XCTAssertEqual(suggestions[phone]?.name, "Michael")
+        XCTAssertEqual(suggestions[phone]?.relation, .alsoOnOtherSource)
+        XCTAssertNil(suggestions[mic], "named speakers get no suggestion")
     }
 
-    func testTwoSpeakersClaimingOneNameKeepsOnlyTheCloser() {
+    func testOnePersonSplitOnOneSourceIsOfferedAsAMerge() {
+        // 2026-11-06: Milan split into Speaker 3 and Speaker 6 on the call audio.
         let closer = SessionSpeakerID()
         let farther = SessionSpeakerID()
+        let named = SessionSpeakerID()
         let suggestions = MeetingSpeakerVoiceSuggester.suggestions(
+            speakers: [.init(id: closer, name: "Speaker 6", trackKind: .applicationAudio),
+                       .init(id: farther, name: "Speaker 3", trackKind: .applicationAudio)],
             clipsBySpeaker: [closer: [self.vector(angle: 0.02)], farther: [self.vector(angle: 0.3)]],
-            voiceprints: [self.print("Serge", angles: [0])],
-            takenNames: []
+            voiceprints: [self.print("Milan", angles: [0])]
         )
-        XCTAssertEqual(suggestions[closer]?.name, "Serge")
-        XCTAssertNil(suggestions[farther])
+        XCTAssertEqual(suggestions[closer]?.relation, .new)
+        XCTAssertEqual(suggestions[farther]?.relation, .sameVoiceAs(closer))
+
+        // Once one of them is named Milan, the other is offered as a merge into it.
+        let afterNaming = MeetingSpeakerVoiceSuggester.suggestions(
+            speakers: [.init(id: named, name: "Milan", trackKind: .applicationAudio),
+                       .init(id: farther, name: "Speaker 3", trackKind: .applicationAudio)],
+            clipsBySpeaker: [named: [self.vector(angle: 0.02)], farther: [self.vector(angle: 0.3)]],
+            voiceprints: [self.print("Milan", angles: [0])]
+        )
+        XCTAssertEqual(afterNaming[farther]?.relation, .sameVoiceAs(named))
+    }
+
+    func testLinesByVoicePicksEachPersonsClosestLine() {
+        let prints = [self.print("Pablo", angles: [0]), self.print("Daniel", angles: [1.5])]
+        let lines = (0..<4).map { _ in UUID() }
+        let picked = MeetingSpeakerVoiceSuggester.linesByVoice(clips: [
+            .init(segmentID: lines[0], embedding: self.vector(angle: 0.2)),
+            .init(segmentID: lines[1], embedding: self.vector(angle: 0.05)),
+            .init(segmentID: lines[2], embedding: self.vector(angle: 1.45)),
+            .init(segmentID: lines[3], embedding: self.vector(angle: 0.8)), // nobody's: ignored
+        ], voiceprints: prints)
+        XCTAssertEqual(picked.map(\.name), ["Pablo", "Daniel"])
+        XCTAssertEqual(picked.map(\.segmentID), [lines[1], lines[2]])
+        XCTAssertTrue(MeetingSpeakerVoiceSuggester.linesByVoice(clips: [
+            .init(segmentID: lines[0], embedding: self.vector(angle: 0)),
+        ], voiceprints: prints).isEmpty, "one voice: no per-voice lines")
+    }
+
+    func testSameNameIsAllowedAcrossAudioSourcesButNotWithinOne() {
+        let mic = SessionSpeakerID()
+        let call = SessionSpeakerID()
+        let call2 = SessionSpeakerID()
+        let current = [(id: mic, displayName: "Michael"), (id: call, displayName: "Speaker 5"), (id: call2, displayName: "Serge")]
+        let kinds: [SessionSpeakerID: MeetingAudioTrackKind] = [mic: .microphone, call: .applicationAudio, call2: .applicationAudio]
+        XCTAssertNil(MeetingAssignSpeakersValidation.duplicateName(current: current, drafts: [call: "Michael"], trackKinds: kinds))
+        XCTAssertEqual(MeetingAssignSpeakersValidation.duplicateName(current: current, drafts: [call: "Serge"], trackKinds: kinds), "Serge")
+    }
+
+    func testLinesMoveOnlyBetweenSpeakersOfTheSameSource() {
+        let mic = MeetingSessionSpeaker(id: UUID(), displayName: "Michael", trackKind: .microphone, isLocalUser: true, identityCandidates: [])
+        let a = MeetingSessionSpeaker(id: UUID(), displayName: "Daniel", trackKind: .applicationAudio, isLocalUser: false, identityCandidates: [])
+        let b = MeetingSessionSpeaker(id: UUID(), displayName: "Speaker 7", trackKind: .applicationAudio, isLocalUser: false, identityCandidates: [])
+        var line = self.segment(speakerID: b.id, start: 0, end: 5)
+        XCTAssertEqual(MeetingResultCanvas.reassignTargets(for: line, among: [mic, a, b]).map(\.id), [a.id])
+        line.speakerID = nil // Unknown lines may go to anyone, as before.
+        XCTAssertEqual(MeetingResultCanvas.reassignTargets(for: line, among: [mic, a, b]).count, 3)
+    }
+
+    func testSampleQuotesPreferCleanLongerLines() {
+        let speaker = SessionSpeakerID()
+        var short = self.segment(speakerID: speaker, start: 0, end: 1.5, text: "No, wasn't that mammography?")
+        short.overlap = .none
+        let clean = self.segment(speakerID: speaker, start: 10, end: 20, text: "A long clean line.")
+        let quotes = MeetingAssignSpeakersQuoteSource.samples(for: speaker, in: [short, clean])
+        XCTAssertEqual(quotes.map(\.text), ["A long clean line.", "No, wasn't that mammography?"])
     }
 
     func testLearningFilesClipsUnderTheNameAndReplacesAnEarlierNameForTheSameSpeaker() {
@@ -163,7 +226,7 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
         for session in try await store.loadAll() {
             guard let directory = try await store.existingSessionDirectory(for: session.id) else { continue }
             for speaker in session.activeSpeakers where !MeetingSpeakerVoiceSuggester.isPlaceholderName(speaker.displayName) {
-                let clips = try await embedder.clips(session: session, speakerID: speaker.id, directory: directory)
+                let clips = try await embedder.clips(session: session, speakerID: speaker.id, directory: directory).map(\.embedding)
                 Swift.print("CALIBRATION meeting=\(session.id.uuidString.prefix(4)) speaker=\(speaker.displayName) track=\(speaker.trackKind.rawValue) clips=\(clips.count)")
                 if !clips.isEmpty {
                     observations.append((speaker.displayName, session.id, speaker.trackKind.rawValue, clips))
@@ -196,7 +259,7 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
         let silent = SessionSpeakerID()
         let keptTurns = [UUID(), UUID()]
         let cached: [SessionSpeakerID: MeetingSpeakerVoiceClipCache.Entry] = [
-            kept: .init(segmentIDs: keptTurns, clips: [self.vector(angle: 0)]),
+            kept: .init(segmentIDs: keptTurns, clips: [self.vector(angle: 0)], clipSegmentIDs: [keptTurns[0]]),
             changed: .init(segmentIDs: [UUID()], clips: [self.vector(angle: 1)]),
         ]
         let plan = MeetingSpeakerVoiceClipCache.plan(cached: cached, wanted: [
@@ -243,7 +306,50 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
         ), [])
     }
 
+    func testVirtualDefaultInputIsReplacedByARealMicrophone() {
+        let devices: [(uid: String, transportType: UInt32)] = [
+            ("BlackHole2ch_UID", kAudioDeviceTransportTypeVirtual),
+            ("Aggregate_UID", kAudioDeviceTransportTypeAggregate),
+            ("AirPods_UID", kAudioDeviceTransportTypeBluetooth),
+            ("BuiltInMicrophoneDevice", kAudioDeviceTransportTypeBuiltIn),
+        ]
+        // AirPods dropped mid-meeting and macOS made BlackHole the default (2026-11-04, 11-06).
+        XCTAssertEqual(MeetingMicrophoneDefaultPolicy.effectiveDefaultUID(
+            systemDefaultUID: "BlackHole2ch_UID", devices: devices
+        ), "BuiltInMicrophoneDevice")
+        XCTAssertEqual(MeetingMicrophoneDefaultPolicy.effectiveDefaultUID(
+            systemDefaultUID: "Aggregate_UID", devices: devices
+        ), "BuiltInMicrophoneDevice")
+        // A real default is always kept, Bluetooth included.
+        XCTAssertEqual(MeetingMicrophoneDefaultPolicy.effectiveDefaultUID(
+            systemDefaultUID: "AirPods_UID", devices: devices
+        ), "AirPods_UID")
+        // Without the built-in mic, any real microphone beats a virtual one.
+        XCTAssertEqual(MeetingMicrophoneDefaultPolicy.effectiveDefaultUID(
+            systemDefaultUID: "BlackHole2ch_UID", devices: Array(devices.prefix(3))
+        ), "AirPods_UID")
+        // Only virtual devices: keep the system default rather than nothing.
+        XCTAssertEqual(MeetingMicrophoneDefaultPolicy.effectiveDefaultUID(
+            systemDefaultUID: "BlackHole2ch_UID", devices: Array(devices.prefix(1))
+        ), "BlackHole2ch_UID")
+    }
+
     // MARK: - Helpers
+
+    private func segment(speakerID: SessionSpeakerID?, start: Double, end: Double, text: String = "words") -> MeetingTranscriptSegment {
+        MeetingTranscriptSegment(
+            id: UUID(),
+            start: MeetingMediaTime(value: Int64(start * 1000), timescale: 1000),
+            end: MeetingMediaTime(value: Int64(end * 1000), timescale: 1000),
+            sourceTrackID: UUID(),
+            speakerID: speakerID,
+            text: text,
+            revision: 0,
+            status: .final,
+            overlap: .none,
+            completeness: .complete
+        )
+    }
 
     /// Unit vectors on a circle in the first two of 256 dimensions; cosine distance = 1 - cos(Δangle).
     private func vector(angle: Float) -> [Float] {

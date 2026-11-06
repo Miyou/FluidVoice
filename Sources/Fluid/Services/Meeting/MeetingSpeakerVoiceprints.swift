@@ -21,8 +21,25 @@ nonisolated struct MeetingSpeakerVoiceprint: Codable, Equatable, Sendable {
 }
 
 nonisolated struct MeetingSpeakerVoiceSuggestion: Equatable, Sendable {
+    enum Relation: Equatable, Sendable {
+        /// Nobody else in this meeting has this voice.
+        case new
+        /// Another speaker on the same audio source has this voice: one person split in two.
+        case sameVoiceAs(SessionSpeakerID)
+        /// The same person on the other audio source (e.g. joined from a phone): same name, no merge.
+        case alsoOnOtherSource
+    }
+
     let name: String
     let distance: Float
+    var relation: Relation = .new
+}
+
+/// A speaker as the suggester sees it: who it is called and which audio source it came from.
+nonisolated struct MeetingSpeakerVoiceCandidate: Sendable {
+    let id: SessionSpeakerID
+    let name: String
+    let trackKind: MeetingAudioTrackKind
 }
 
 nonisolated enum MeetingSpeakerVoiceSuggester {
@@ -56,31 +73,66 @@ nonisolated enum MeetingSpeakerVoiceSuggester {
         }.sorted { $0.distance == $1.distance ? $0.name < $1.name : $0.distance < $1.distance }
     }
 
-    /// One suggestion per unnamed speaker. A name already used in this meeting is never offered,
-    /// and when two speakers resolve to the same name only the closer one keeps it.
+    /// The confident, unambiguous name for one speaker's clips, if any.
+    static func bestName(clips: [[Float]], voiceprints: [MeetingSpeakerVoiceprint]) -> MeetingSpeakerVoiceSuggestion? {
+        let ranked = self.ranked(clips: clips, voiceprints: voiceprints)
+        guard let first = ranked.first, first.distance <= self.maximumDistance else { return nil }
+        if ranked.count > 1, ranked[1].distance - first.distance < self.ambiguityMargin { return nil }
+        return first
+    }
+
+    /// One suggestion per unnamed speaker. One person can appear as several speakers (split by the
+    /// diarizer, or joining again from a phone), so a voice that already has a speaker in this
+    /// meeting is offered as "same voice" (same audio source, merge) or as the same name on the
+    /// other audio source, instead of being hidden.
     static func suggestions(
+        speakers: [MeetingSpeakerVoiceCandidate],
         clipsBySpeaker: [SessionSpeakerID: [[Float]]],
-        voiceprints: [MeetingSpeakerVoiceprint],
-        takenNames: Set<String>
+        voiceprints: [MeetingSpeakerVoiceprint]
     ) -> [SessionSpeakerID: MeetingSpeakerVoiceSuggestion] {
-        let taken = Set(takenNames.map { $0.lowercased() })
-        let available = voiceprints.filter { !taken.contains($0.name.lowercased()) }
         var best: [SessionSpeakerID: MeetingSpeakerVoiceSuggestion] = [:]
-        for (speakerID, clips) in clipsBySpeaker {
-            let ranked = self.ranked(clips: clips, voiceprints: available)
-            guard let first = ranked.first, first.distance <= self.maximumDistance else { continue }
-            if ranked.count > 1, ranked[1].distance - first.distance < self.ambiguityMargin { continue }
-            best[speakerID] = first
+        for speaker in speakers where self.isPlaceholderName(speaker.name) {
+            guard let clips = clipsBySpeaker[speaker.id], let match = self.bestName(clips: clips, voiceprints: voiceprints)
+            else { continue }
+            best[speaker.id] = match
         }
-        let byName = Dictionary(grouping: best, by: { $0.value.name.lowercased() })
-        for (_, claims) in byName where claims.count > 1 {
-            let winner = claims.min { $0.value.distance == $1.value.distance
-                ? $0.key.uuidString < $1.key.uuidString : $0.value.distance < $1.value.distance }
-            for claim in claims where claim.key != winner?.key {
-                best[claim.key] = nil
+        var result: [SessionSpeakerID: MeetingSpeakerVoiceSuggestion] = [:]
+        for speaker in speakers {
+            guard var suggestion = best[speaker.id] else { continue }
+            let key = suggestion.name.lowercased()
+            // Who already holds the voice: a speaker named so, or a closer unnamed claimant.
+            let holders = speakers.filter { other in
+                guard other.id != speaker.id else { return false }
+                if other.name.lowercased() == key { return true }
+                guard let theirs = best[other.id], theirs.name.lowercased() == key else { return false }
+                return theirs.distance == suggestion.distance
+                    ? other.id.uuidString < speaker.id.uuidString : theirs.distance < suggestion.distance
+            }
+            if let sameSource = holders.first(where: { $0.trackKind == speaker.trackKind }) {
+                suggestion.relation = .sameVoiceAs(sameSource.id)
+            } else if !holders.isEmpty {
+                suggestion.relation = .alsoOnOtherSource
+            }
+            result[speaker.id] = suggestion
+        }
+        return result
+    }
+
+    /// For a speaker whose clips match different people: the best line for each person, so each
+    /// voice can be played and checked on its own.
+    static func linesByVoice(
+        clips: [MeetingSpeakerVoiceClip],
+        voiceprints: [MeetingSpeakerVoiceprint]
+    ) -> [(name: String, segmentID: MeetingTranscriptSegmentID)] {
+        var bestByName: [String: (distance: Float, segmentID: MeetingTranscriptSegmentID)] = [:]
+        for clip in clips {
+            guard let match = self.bestName(clips: [clip.embedding], voiceprints: voiceprints) else { continue }
+            if bestByName[match.name].map({ match.distance < $0.distance }) ?? true {
+                bestByName[match.name] = (match.distance, clip.segmentID)
             }
         }
-        return best
+        guard bestByName.count > 1 else { return [] }
+        return bestByName.sorted { $0.value.distance < $1.value.distance }.map { ($0.key, $0.value.segmentID) }
     }
 
     /// Replaces whatever this meeting speaker previously taught (it may have been renamed), then
@@ -230,6 +282,12 @@ actor MeetingSpeakerVoiceprintStore {
     }
 }
 
+/// One embedded turn: the voice vector and the transcript line it came from.
+nonisolated struct MeetingSpeakerVoiceClip: Equatable, Sendable {
+    let segmentID: MeetingTranscriptSegmentID
+    let embedding: [Float]
+}
+
 /// Embeds a speaker's clean turns with the same local model the meeting pipeline uses to keep
 /// speakers apart. Reads the meeting's own audio files; nothing is uploaded.
 final nonisolated class MeetingSpeakerVoiceEmbedder: @unchecked Sendable {
@@ -238,11 +296,11 @@ final nonisolated class MeetingSpeakerVoiceEmbedder: @unchecked Sendable {
     private var maskFrames = 0
     #endif
 
-    func clips(session: MeetingSession, speakerID: SessionSpeakerID, directory: URL) async throws -> [[Float]] {
+    func clips(session: MeetingSession, speakerID: SessionSpeakerID, directory: URL) async throws -> [MeetingSpeakerVoiceClip] {
         #if arch(arm64)
         let extractor = try await self.loadExtractor()
         let mask = [Float](repeating: 1, count: self.maskFrames)
-        var clips: [[Float]] = []
+        var clips: [MeetingSpeakerVoiceClip] = []
         for segment in MeetingSpeakerVoiceClipSource.segments(for: speakerID, in: session.transcriptSegments) {
             try Task.checkCancellation()
             guard let slices = try? MeetingSegmentPlaybackPlan.slices(session: session, segment: segment, directory: directory)
@@ -257,7 +315,7 @@ final nonisolated class MeetingSpeakerVoiceEmbedder: @unchecked Sendable {
             guard let clip = MeetingSpeakerVoiceClipSource.trimmed(samples) else { continue }
             let output = try extractor.getEmbeddings(audio: clip, masks: [mask])
             if let embedding = output.first, embedding.count == 256, embedding.allSatisfy(\.isFinite) {
-                clips.append(embedding)
+                clips.append(MeetingSpeakerVoiceClip(segmentID: segment.id, embedding: embedding))
             }
         }
         return clips
@@ -299,12 +357,20 @@ actor MeetingSpeakerVoiceClipCache {
     nonisolated struct Entry: Codable, Equatable, Sendable {
         var segmentIDs: [MeetingTranscriptSegmentID]
         var clips: [[Float]]
+        /// The line each clip came from. Missing in caches written before it existed; those
+        /// entries are embedded again.
+        var clipSegmentIDs: [MeetingTranscriptSegmentID]? = nil
+
+        var voiceClips: [MeetingSpeakerVoiceClip] {
+            guard let clipSegmentIDs, clipSegmentIDs.count == self.clips.count else { return [] }
+            return zip(clipSegmentIDs, self.clips).map { MeetingSpeakerVoiceClip(segmentID: $0, embedding: $1) }
+        }
     }
 
     static let shared = MeetingSpeakerVoiceClipCache()
 
     private let directory: URL
-    private var inFlight: [MeetingSessionID: Task<[SessionSpeakerID: [[Float]]], Error>] = [:]
+    private var inFlight: [MeetingSessionID: Task<[SessionSpeakerID: [MeetingSpeakerVoiceClip]], Error>] = [:]
 
     init(directory: URL? = nil) {
         if let directory {
@@ -326,7 +392,9 @@ actor MeetingSpeakerVoiceClipCache {
         var reuse: [SessionSpeakerID: Entry] = [:]
         var embed: [SessionSpeakerID] = []
         for (speakerID, segmentIDs) in wanted where !segmentIDs.isEmpty {
-            if let entry = cached[speakerID], entry.segmentIDs == segmentIDs {
+            if let entry = cached[speakerID], entry.segmentIDs == segmentIDs,
+               entry.clipSegmentIDs?.count == entry.clips.count
+            {
                 reuse[speakerID] = entry
             } else {
                 embed.append(speakerID)
@@ -337,7 +405,7 @@ actor MeetingSpeakerVoiceClipCache {
 
     /// Clips for every active speaker, embedding only what is missing or stale. Concurrent callers
     /// for one meeting (the background pass and an opened sheet) share a single pass.
-    func clips(sessionID: MeetingSessionID) async throws -> [SessionSpeakerID: [[Float]]] {
+    func clips(sessionID: MeetingSessionID) async throws -> [SessionSpeakerID: [MeetingSpeakerVoiceClip]] {
         if let running = self.inFlight[sessionID] { return try await running.value }
         let file = self.directory.appendingPathComponent("\(sessionID.uuidString).json")
         let directory = self.directory
@@ -351,7 +419,7 @@ actor MeetingSpeakerVoiceClipCache {
 
     private nonisolated static func refresh(
         sessionID: MeetingSessionID, file: URL, directory: URL
-    ) async throws -> [SessionSpeakerID: [[Float]]] {
+    ) async throws -> [SessionSpeakerID: [MeetingSpeakerVoiceClip]] {
         guard let session = try await MeetingSessionStore.shared.load(id: sessionID),
               let sessionDirectory = try await MeetingSessionStore.shared.existingSessionDirectory(for: sessionID)
         else { throw MeetingSegmentPlaybackError.unavailable }
@@ -365,7 +433,9 @@ actor MeetingSpeakerVoiceClipCache {
         for speakerID in plan.embed {
             try Task.checkCancellation()
             let clips = try await embedder.clips(session: session, speakerID: speakerID, directory: sessionDirectory)
-            entries[speakerID] = Entry(segmentIDs: wanted[speakerID] ?? [], clips: clips)
+            entries[speakerID] = Entry(
+                segmentIDs: wanted[speakerID] ?? [], clips: clips.map(\.embedding), clipSegmentIDs: clips.map(\.segmentID)
+            )
         }
         if entries != cached {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -375,7 +445,7 @@ actor MeetingSpeakerVoiceClipCache {
             "voice-clips session=\(sessionID.uuidString.prefix(8)) reused=\(plan.reuse.count) embedded=\(plan.embed.count)",
             source: "MeetingSpeakerVoice"
         )
-        return entries.compactMapValues { $0.clips.isEmpty ? nil : $0.clips }
+        return entries.compactMapValues { $0.voiceClips.isEmpty ? nil : $0.voiceClips }
     }
 }
 
@@ -393,6 +463,8 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
     @Published private(set) var status: Status = .idle
     @Published private(set) var suggestions: [SessionSpeakerID: MeetingSpeakerVoiceSuggestion] = [:]
     @Published private(set) var mixedVoices: [SessionSpeakerID: [String]] = [:]
+    /// For mixed speakers: the best line for each matched person, to play and check.
+    @Published private(set) var linesByVoice: [SessionSpeakerID: [(name: String, segmentID: MeetingTranscriptSegmentID)]] = [:]
 
     private let store: MeetingSpeakerVoiceprintStore
     private let clipCache: MeetingSpeakerVoiceClipCache
@@ -413,14 +485,13 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
             do {
                 // Usually already prepared when the meeting was opened, so this is a file read.
                 let speakerIDs = Set(speakers.map(\.id))
-                let clipsBySpeaker = try await clipCache.clips(sessionID: sessionID).filter { speakerIDs.contains($0.key) }
+                let voiceClips = try await clipCache.clips(sessionID: sessionID).filter { speakerIDs.contains($0.key) }
+                let clipsBySpeaker = voiceClips.mapValues { $0.map(\.embedding) }
                 let voiceprints = await store.all()
-                let unnamed = speakers.filter { MeetingSpeakerVoiceSuggester.isPlaceholderName($0.displayName) }.map(\.id)
-                let taken = Set(speakers.map(\.displayName).filter { !MeetingSpeakerVoiceSuggester.isPlaceholderName($0) })
                 let suggestions = MeetingSpeakerVoiceSuggester.suggestions(
-                    clipsBySpeaker: clipsBySpeaker.filter { unnamed.contains($0.key) },
-                    voiceprints: voiceprints,
-                    takenNames: taken
+                    speakers: speakers.map { .init(id: $0.id, name: $0.displayName, trackKind: $0.trackKind) },
+                    clipsBySpeaker: clipsBySpeaker,
+                    voiceprints: voiceprints
                 )
                 for speaker in speakers {
                     guard let clips = clipsBySpeaker[speaker.id] else { continue }
@@ -440,9 +511,14 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
                     let names = MeetingSpeakerVoiceSuggester.mixedVoices(clips: clips, voiceprints: voiceprints)
                     return names.isEmpty ? nil : names
                 }
+                let lines = voiceClips.filter { mixed[$0.key] != nil }.compactMapValues { clips in
+                    let lines = MeetingSpeakerVoiceSuggester.linesByVoice(clips: clips, voiceprints: voiceprints)
+                    return lines.isEmpty ? nil : lines
+                }
                 guard let self, !Task.isCancelled else { return }
                 self.clipsBySpeaker = clipsBySpeaker
                 self.mixedVoices = mixed
+                self.linesByVoice = lines
                 self.suggestions = suggestions.filter { mixed[$0.key] == nil }
                 self.status = .ready
             } catch {
@@ -468,7 +544,7 @@ final class MeetingSpeakerVoiceAssistant: ObservableObject {
         let clipCache = self.clipCache
         Task.detached(priority: .utility) {
             // The save may have merged speakers, so the cache re-embeds any whose turns changed.
-            let current = (try? await clipCache.clips(sessionID: sessionID)) ?? cached
+            let current = (try? await clipCache.clips(sessionID: sessionID))?.mapValues { $0.map(\.embedding) } ?? cached
             for (speakerID, name) in edits.names where edits.merges[speakerID] == nil {
                 let clips = current[speakerID] ?? []
                 do {
