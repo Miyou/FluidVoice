@@ -4449,7 +4449,9 @@ final class MeetingRecoveryTests: XCTestCase {
         let saved = try await coordinator.moveLines(
             sessionID: session.id, moves: MeetingLineMoves(toNew: [firstLine: "Pablo", second.id: " pablo "])
         )
-        let pablo = try XCTUnwrap(saved.activeSpeakers.first { $0.displayName == "Pablo" })
+        let pablos = saved.activeSpeakers.filter { $0.displayName.caseInsensitiveCompare("pablo") == .orderedSame }
+        XCTAssertEqual(pablos.count, 1, "differently spelled names still give one speaker")
+        let pablo = try XCTUnwrap(pablos.first)
         XCTAssertEqual(saved.activeSpeakers.count, session.activeSpeakers.count + 1)
         XCTAssertEqual(saved.transcriptSegments.map(\.speakerID), [pablo.id, pablo.id])
         XCTAssertEqual(pablo.trackKind, .microphone, "a new speaker joins the line's own audio source")
