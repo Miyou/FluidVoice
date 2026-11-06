@@ -85,7 +85,7 @@ final class MeetingSpeakerVoiceprintTests: XCTestCase {
         let picked = MeetingSpeakerVoiceSuggester.linesByVoice(clips: [
             .init(segmentID: lines[0], embedding: self.vector(angle: 0.2)),
             .init(segmentID: lines[1], embedding: self.vector(angle: 0.05)),
-            .init(segmentID: lines[2], embedding: self.vector(angle: 1.45)),
+            .init(segmentID: lines[2], embedding: self.vector(angle: 1.35)), // a bit further: Daniel second
             .init(segmentID: lines[3], embedding: self.vector(angle: 0.8)), // nobody's: ignored
         ], voiceprints: prints)
         XCTAssertEqual(picked.map(\.name), ["Pablo", "Daniel"])

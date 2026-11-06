@@ -132,7 +132,9 @@ nonisolated enum MeetingSpeakerVoiceSuggester {
             }
         }
         guard bestByName.count > 1 else { return [] }
-        return bestByName.sorted { $0.value.distance < $1.value.distance }.map { ($0.key, $0.value.segmentID) }
+        return bestByName
+            .sorted { $0.value.distance == $1.value.distance ? $0.key < $1.key : $0.value.distance < $1.value.distance }
+            .map { ($0.key, $0.value.segmentID) }
     }
 
     /// Replaces whatever this meeting speaker previously taught (it may have been renamed), then
